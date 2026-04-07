@@ -34,6 +34,8 @@ class YOLO26Backend(DetectionBackend):
         self._names: dict[int, str] = {}
         self._model_name = config.detector_model
         self._device = "cpu"
+        self._use_half = False
+        self._target_class_ids: list[int] | None = None
 
     def load(self) -> None:
         try:
@@ -49,9 +51,20 @@ class YOLO26Backend(DetectionBackend):
             if self._config.detector_device != "auto":
                 self._device = self._config.detector_device
             else:
-                self._device = "cuda" if torch.cuda.is_available() else "cpu"
+                self._device = "cuda:0" if torch.cuda.is_available() else "cpu"
+
+            if self._device.startswith("cuda") and torch.cuda.is_available():
+                self._use_half = bool(self._config.detector_half_precision)
+                torch.backends.cudnn.benchmark = True
+                torch.backends.cuda.matmul.allow_tf32 = True
+                torch.backends.cudnn.allow_tf32 = True
+                if hasattr(torch, "set_float32_matmul_precision"):
+                    torch.set_float32_matmul_precision("high")
+            else:
+                self._use_half = False
         except Exception:
             self._device = "cpu"
+            self._use_half = False
 
         candidates = [self._config.detector_model, self._config.detector_fallback_model]
         last_error = ""
@@ -68,9 +81,14 @@ class YOLO26Backend(DetectionBackend):
                 self._model_name = name
                 raw_names = getattr(model, "names", {}) or {}
                 self._names = {int(key): str(value) for key, value in raw_names.items()}
+                self._target_class_ids = self._resolve_target_class_ids()
+                self._warmup_model()
                 bus.emit(
                     SystemEvents.LOG_MESSAGE,
-                    f"[DetectionEngine] Loaded {name} on {self._device} for backend {self._config.detector_backend}.",
+                    "[DetectionEngine] Loaded "
+                    f"{name} on {self._device} "
+                    f"({'fp16' if self._use_half else 'fp32'}) "
+                    f"for backend {self._config.detector_backend}.",
                 )
                 return
             except Exception as exc:
@@ -84,7 +102,7 @@ class YOLO26Backend(DetectionBackend):
             return []
 
         try:
-            results = self._model(frame, verbose=False)
+            results = self._model.predict(frame, **self._predict_kwargs(frame))
             detections = list(self._filter_detections(results))
             bus.emit(SystemEvents.DETECTIONS_UPDATED, detections)
             if not detections:
@@ -94,6 +112,44 @@ class YOLO26Backend(DetectionBackend):
             bus.emit(SystemEvents.LOG_MESSAGE, f"[DetectionEngine] Inference error: {exc}")
             bus.emit(SystemEvents.ROVER_NO_DETECTION, None)
             return []
+
+    def _predict_kwargs(self, frame: np.ndarray | None = None) -> dict[str, object]:
+        imgsz = self._resolve_image_size(frame)
+        kwargs: dict[str, object] = {
+            "verbose": False,
+            "device": self._device,
+            "conf": self._config.detector_confidence,
+            "imgsz": imgsz,
+            "max_det": self._config.detector_max_detections,
+        }
+        if self._use_half:
+            kwargs["half"] = True
+        if self._target_class_ids:
+            kwargs["classes"] = self._target_class_ids
+        return kwargs
+
+    def _resolve_image_size(self, frame: np.ndarray | None) -> int:
+        if frame is not None and len(frame.shape) >= 2:
+            return max(64, int(max(frame.shape[0], frame.shape[1])))
+        return max(64, min(int(self._config.detector_input_width), 640))
+
+    def _resolve_target_class_ids(self) -> list[int] | None:
+        target_label = (self._config.target_label or "").strip().lower()
+        if not target_label:
+            return None
+        matched = [class_id for class_id, label in self._names.items() if label.strip().lower() == target_label]
+        return matched or None
+
+    def _warmup_model(self) -> None:
+        if self._model is None:
+            return
+        try:
+            warmup_width = max(64, min(int(self._config.detector_input_width), 640))
+            warmup_height = max(64, int(round(warmup_width * 3 / 4)))
+            warmup = np.zeros((warmup_height, warmup_width, 3), dtype=np.uint8)
+            self._model.predict(warmup, **self._predict_kwargs(warmup))
+        except Exception as exc:
+            bus.emit(SystemEvents.LOG_MESSAGE, f"[DetectionEngine] Warmup skipped: {exc}")
 
     def _filter_detections(self, results) -> Iterable[Detection]:
         for result in results:

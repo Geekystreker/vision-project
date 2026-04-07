@@ -2,3 +2,6 @@
 __pycache__/
 *.pyc
 .env
+.venv/
+yolo26n.pt
+yolov8n.pt

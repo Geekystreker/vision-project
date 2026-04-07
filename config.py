@@ -20,11 +20,11 @@ DEFAULT_KNOWLEDGE_PATHS = (
     "config.py",
     "modules",
 )
-DEFAULT_ESP32_IP = os.getenv("ROVER_ESP32_IP", "192.168.137.113")
+DEFAULT_ESP32_IP = os.getenv("ROVER_ESP32_IP", "192.168.137.110")
 DEFAULT_CAMERA_STREAM_URL = os.getenv("ROVER_CAMERA_STREAM_URL", f"http://{DEFAULT_ESP32_IP}:81/stream")
 DEFAULT_SERVO_WS_URL = os.getenv("ROVER_SERVO_WS_URL", f"ws://{DEFAULT_ESP32_IP}/ServoInput")
 DEFAULT_MOTOR_WS_URL = os.getenv("ROVER_MOTOR_WS_URL", "")
-DEFAULT_PERFORMANCE_PROFILE = (os.getenv("VISION_PERF_PROFILE", "mx330") or "mx330").strip().lower()
+DEFAULT_PERFORMANCE_PROFILE = (os.getenv("VISION_PERF_PROFILE", "rtx5060") or "rtx5060").strip().lower()
 
 
 class Config:
@@ -47,7 +47,7 @@ class RoverConfig:
     motor_url: str
 
     # UI / timing
-    performance_profile: str = "mx330"
+    performance_profile: str = "rtx5060"
     vision_loop_hz: int = 30
     ui_frame_hz: int = 30
     detection_hz: int = 8
@@ -80,6 +80,8 @@ class RoverConfig:
     detector_fallback_model: str = "yolov8n.pt"
     detector_confidence: float = 0.50
     detector_device: str = "auto"
+    detector_half_precision: bool = True
+    detector_max_detections: int = 6
     detector_input_width: int = 416
     target_label: str = "person"
 
@@ -141,11 +143,11 @@ PERFORMANCE_PROFILES: dict[str, dict[str, int | float | str]] = {
     },
     "rtx5060": {
         "performance_profile": "rtx5060",
-        "vision_loop_hz": 48,
-        "ui_frame_hz": 45,
-        "detection_hz": 16,
-        "snapshot_poll_hz": 20,
-        "detector_input_width": 640,
+        "vision_loop_hz": 60,
+        "ui_frame_hz": 60,
+        "detection_hz": 24,
+        "snapshot_poll_hz": 30,
+        "detector_input_width": 960,
     },
 }
 

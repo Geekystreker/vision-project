@@ -1,0 +1,7 @@
+# Base project dependencies.
+-r requirements.txt
+
+# Replace CPU-only Torch builds with CUDA builds for NVIDIA GPUs.
+--index-url https://download.pytorch.org/whl/cu128
+torch
+torchvision

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 import subprocess
 import sys
 from pathlib import Path
@@ -11,6 +12,7 @@ from PyQt5.QtWidgets import QAction, QApplication, QMenu, QSystemTrayIcon
 
 from config import Config, rover_config
 from modules.audio_service import AudioService
+from runtime_bootstrap import project_venv_python
 
 
 class VisionTrayLauncher(QObject):
@@ -52,7 +54,16 @@ class VisionTrayLauncher(QObject):
             socket.disconnectFromServer()
             return
 
-        subprocess.Popen([sys.executable, str(self._main_script)], shell=False)
+        project_root = self._main_script.parent
+        python_executable = project_venv_python(project_root) or Path(sys.executable).resolve()
+        env = os.environ.copy()
+        env["PYTHONNOUSERSITE"] = "1"
+        subprocess.Popen(
+            [str(python_executable), str(self._main_script)],
+            shell=False,
+            cwd=str(project_root),
+            env=env,
+        )
 
     def _build_menu(self) -> QMenu:
         menu = QMenu()

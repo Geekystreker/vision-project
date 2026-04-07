@@ -50,6 +50,7 @@ class RoverVisionApp:
         self._detection_frame_size: tuple[int, int] = (0, 0)
         self._detection_scale: tuple[float, float] = (1.0, 1.0)
         self._detection_event = threading.Event()
+        self._detection_load_lock = threading.Lock()
         self._detection_state_lock = threading.Lock()
         self._link_states = {
             "camera": ConnectionState.DISCONNECTED,
@@ -83,6 +84,11 @@ class RoverVisionApp:
             target=self._detection_loop,
             daemon=True,
             name="DetectionWorker_Thread",
+        ).start()
+        threading.Thread(
+            target=self._preload_detection,
+            daemon=True,
+            name="DetectionPreload_Thread",
         ).start()
 
         loop_interval = 1.0 / max(1, self._config.vision_loop_hz)
@@ -330,8 +336,17 @@ class RoverVisionApp:
     def _ensure_detection_loaded(self) -> None:
         if self._detection_loaded:
             return
-        self._detection_engine.load()
-        self._detection_loaded = True
+        with self._detection_load_lock:
+            if self._detection_loaded:
+                return
+            self._detection_engine.load()
+            self._detection_loaded = True
+
+    def _preload_detection(self) -> None:
+        try:
+            self._ensure_detection_loaded()
+        except Exception as exc:
+            bus.emit(SystemEvents.LOG_MESSAGE, f"[RoverVisionApp] detector preload failed: {exc}")
 
     def _build_render_key(self, raw, detections, target, mode: ControlMode):
         detection_key = tuple(

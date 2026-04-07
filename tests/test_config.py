@@ -14,6 +14,8 @@ def test_required_fields_exist():
     cfg = DUMMY_CONFIG
     assert cfg.detector_backend == "yolo26"
     assert cfg.target_label == "person"
+    assert cfg.detector_half_precision is True
+    assert cfg.detector_max_detections == 6
     assert cfg.audio_sample_rate > 0
     assert cfg.key_repeat_hz > 0
     assert cfg.stt_backend
@@ -57,11 +59,11 @@ def test_build_rover_config_uses_rtx5060_profile_defaults():
     cfg = build_rover_config("rtx5060")
 
     assert cfg.performance_profile == "rtx5060"
-    assert cfg.vision_loop_hz == 48
-    assert cfg.ui_frame_hz == 45
-    assert cfg.detection_hz == 16
-    assert cfg.snapshot_poll_hz == 20
-    assert cfg.detector_input_width == 640
+    assert cfg.vision_loop_hz == 60
+    assert cfg.ui_frame_hz == 60
+    assert cfg.detection_hz == 24
+    assert cfg.snapshot_poll_hz == 30
+    assert cfg.detector_input_width == 960
 
 
 def test_build_rover_config_falls_back_to_mx330_for_unknown_profile():

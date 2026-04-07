@@ -3,6 +3,11 @@ from __future__ import annotations
 import os
 import sys
 import threading
+from pathlib import Path
+
+from runtime_bootstrap import ensure_project_venv
+
+ensure_project_venv(Path(__file__).resolve().parent)
 
 from PyQt5.QtCore import QObject, pyqtSignal
 from PyQt5.QtNetwork import QLocalServer, QLocalSocket

@@ -1,0 +1,15 @@
+PyQt5
+numpy
+opencv-python
+websocket-client
+rapidfuzz
+pyaudio
+pyttsx3
+SpeechRecognition
+sounddevice
+python-dotenv
+faster-whisper
+onnxruntime
+ultralytics
+torch
+piper-tts

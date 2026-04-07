@@ -135,17 +135,17 @@ class ArcReactorWidget(QWidget):
         painter.setCompositionMode(QPainter.CompositionMode_Screen)
 
         outer = QRadialGradient(center, radius)
-        outer.setColorAt(0.00, QColor(0, 255, 255, int(130 * self._glow_strength)))
-        outer.setColorAt(0.42, QColor(0, 180, 255, int(78 * self._glow_strength)))
-        outer.setColorAt(0.80, QColor(0, 100, 170, int(20 * self._glow_strength)))
+        outer.setColorAt(0.00, QColor(255, 128, 86, int(132 * self._glow_strength)))
+        outer.setColorAt(0.42, QColor(220, 72, 54, int(82 * self._glow_strength)))
+        outer.setColorAt(0.80, QColor(120, 34, 28, int(24 * self._glow_strength)))
         outer.setColorAt(1.00, QColor(0, 0, 0, 0))
         painter.setBrush(outer)
         painter.drawEllipse(center, radius, radius)
 
         inner_radius = radius * 0.62
         inner = QRadialGradient(center, inner_radius)
-        inner.setColorAt(0.00, QColor(150, 255, 255, int(110 * self._glow_strength)))
-        inner.setColorAt(0.55, QColor(20, 185, 255, int(44 * self._glow_strength)))
+        inner.setColorAt(0.00, QColor(174, 245, 255, int(112 * self._glow_strength)))
+        inner.setColorAt(0.55, QColor(75, 198, 255, int(48 * self._glow_strength)))
         inner.setColorAt(1.00, QColor(0, 0, 0, 0))
         painter.setBrush(inner)
         painter.drawEllipse(center, inner_radius, inner_radius)
@@ -156,14 +156,14 @@ class ArcReactorWidget(QWidget):
         painter.save()
         painter.setBrush(Qt.NoBrush)
 
-        ring_pen = QPen(QColor(45, 170, 220, 42))
+        ring_pen = QPen(QColor(224, 150, 95, 42))
         ring_pen.setWidthF(1.2)
         painter.setPen(ring_pen)
         for factor in (0.55, 0.75, 0.93, 1.08):
             r = radius * factor
             painter.drawEllipse(center, r, r)
 
-        spoke_pen = QPen(QColor(85, 230, 255, 36))
+        spoke_pen = QPen(QColor(246, 178, 117, 34))
         spoke_pen.setWidthF(1.0)
         painter.setPen(spoke_pen)
         for idx in range(12):
@@ -181,7 +181,7 @@ class ArcReactorWidget(QWidget):
         painter.save()
         painter.setBrush(Qt.NoBrush)
 
-        ring_color = QColor(0, 235, 255, int(110 + (120 * self._glow_strength)))
+        ring_color = QColor(255, 182, 92, int(110 + (120 * self._glow_strength)))
         pen = QPen(ring_color)
         pen.setWidthF(max(2.0, radius * 0.06))
         pen.setCapStyle(Qt.RoundCap)
@@ -193,7 +193,7 @@ class ArcReactorWidget(QWidget):
             start = int((offset + self.angle) * 16.0)
             painter.drawArc(rect, start, int(span * 16.0))
 
-        tick_pen = QPen(QColor(120, 245, 255, int(80 + 90 * self._glow_strength)))
+        tick_pen = QPen(QColor(255, 208, 142, int(80 + 90 * self._glow_strength)))
         tick_pen.setWidthF(1.3)
         painter.setPen(tick_pen)
         for i in range(36):
@@ -212,15 +212,15 @@ class ArcReactorWidget(QWidget):
         painter.setCompositionMode(QPainter.CompositionMode_Screen)
 
         core = QRadialGradient(center, radius)
-        core.setColorAt(0.00, QColor(230, 255, 255, int(235 * self._glow_strength + 20)))
-        core.setColorAt(0.30, QColor(85, 235, 255, int(215 * self._glow_strength + 20)))
-        core.setColorAt(0.70, QColor(0, 140, 255, int(180 * self._glow_strength + 16)))
+        core.setColorAt(0.00, QColor(236, 255, 255, int(235 * self._glow_strength + 20)))
+        core.setColorAt(0.30, QColor(118, 236, 255, int(212 * self._glow_strength + 20)))
+        core.setColorAt(0.70, QColor(255, 144, 76, int(178 * self._glow_strength + 18)))
         core.setColorAt(1.00, QColor(0, 12, 30, 0))
         painter.setPen(Qt.NoPen)
         painter.setBrush(core)
         painter.drawEllipse(center, radius, radius)
 
-        ring_pen = QPen(QColor(160, 252, 255, int(145 + 90 * self._glow_strength)))
+        ring_pen = QPen(QColor(255, 202, 132, int(145 + 90 * self._glow_strength)))
         ring_pen.setWidthF(max(2.0, radius * 0.11))
         painter.setPen(ring_pen)
         painter.setBrush(Qt.NoBrush)
@@ -228,8 +228,8 @@ class ArcReactorWidget(QWidget):
 
         inner_pulse = radius * (0.20 + 0.05 * math.sin(self._pulse_phase * 1.2))
         pulse_glow = QRadialGradient(center, inner_pulse * 2.5)
-        pulse_glow.setColorAt(0.00, QColor(220, 255, 255, int(140 * self._glow_strength)))
-        pulse_glow.setColorAt(0.45, QColor(65, 220, 255, int(75 * self._glow_strength)))
+        pulse_glow.setColorAt(0.00, QColor(205, 255, 255, int(140 * self._glow_strength)))
+        pulse_glow.setColorAt(0.45, QColor(255, 164, 98, int(78 * self._glow_strength)))
         pulse_glow.setColorAt(1.00, QColor(0, 0, 0, 0))
         painter.setPen(Qt.NoPen)
         painter.setBrush(pulse_glow)

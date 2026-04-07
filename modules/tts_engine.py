@@ -1,6 +1,8 @@
 import queue
 import time
 import threading
+import os
+import site
 from pathlib import Path
 
 import numpy as np
@@ -10,16 +12,7 @@ import pyaudio
 _MODEL_DIR = Path(__file__).resolve().parent.parent / "models"
 _ONNX_MODEL = _MODEL_DIR / "en_US-lessac-medium.onnx"
 
-# Try to load Piper; fall back to pyttsx3 silently at import time
-# Try to load Piper; fall back to pyttsx3 silently at import time
-try:
-    from piper import PiperVoice
-    _PIPER_AVAILABLE = _ONNX_MODEL.exists()
-    if not _PIPER_AVAILABLE:
-        print(f"[TTS/Init] Piper available but model missing at {_ONNX_MODEL}")
-except Exception as e:
-    print(f"[TTS/Init] Piper unavailable: {e}")
-    _PIPER_AVAILABLE = False
+_PIPER_AVAILABLE = _ONNX_MODEL.exists()
 
 class TTSEngine:
     """
@@ -105,6 +98,8 @@ class TTSEngine:
                 cls._run_piper_loop()
             except Exception as e:
                 print(f"[TTS/Thread] Piper loop crashed: {e}")
+                print("[TTS/Thread] Falling back to pyttsx3 loop...")
+                cls._run_pyttsx3_loop()
         else:
             print("[TTS/Thread] Routing to pyttsx3 loop...")
             cls._run_pyttsx3_loop()
@@ -112,6 +107,24 @@ class TTSEngine:
     @classmethod
     def _run_piper_loop(cls):
         print("[TTS/Piper] Importing PiperVoice...")
+        if hasattr(os, "add_dll_directory"):
+            candidate_paths = []
+            for site_root in site.getsitepackages() + [site.getusersitepackages()]:
+                root = Path(site_root)
+                candidate_paths.extend(
+                    [
+                        root / "onnxruntime" / "capi",
+                        root / "onnxruntime.libs",
+                    ]
+                )
+            for path in candidate_paths:
+                if path.exists():
+                    try:
+                        os.add_dll_directory(str(path))
+                    except OSError:
+                        pass
+
+        import onnxruntime  # noqa: F401
         from piper import PiperVoice
 
         print(f"[TTS/Piper] Loading model: {_ONNX_MODEL}")

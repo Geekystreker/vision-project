@@ -5,8 +5,8 @@ from config import PROJECT_ROOT, RoverConfig, build_rover_config
 
 DUMMY_CONFIG = RoverConfig(
     vision_stream_url="ws://localhost/Camera",
-    servo_url="ws://localhost/ServoInput",
-    motor_url="ws://localhost/Motors",
+    servo_url="ws://localhost/Jarvis",
+    motor_url="ws://localhost/Jarvis",
 )
 
 
@@ -16,6 +16,31 @@ def test_required_fields_exist():
     assert cfg.target_label == "person"
     assert cfg.detector_half_precision is True
     assert cfg.detector_max_detections == 6
+    assert cfg.detector_confidence == 0.30
+    assert cfg.servo_send_hz > 0
+    assert cfg.servo_center_angle == 90
+    assert cfg.servo_min_angle == 10
+    assert cfg.servo_max_angle == 170
+    assert cfg.servo_pan_min_angle == 10
+    assert cfg.servo_pan_max_angle == 170
+    assert cfg.servo_tilt_min_angle == 10
+    assert cfg.servo_tilt_max_angle == 155
+    assert cfg.servo_manual_pan_direction in {-1, 1}
+    assert cfg.servo_manual_tilt_direction in {-1, 1}
+    assert cfg.motor_drive_speed > 0
+    assert cfg.motor_turn_speed > 0
+    assert cfg.motor_send_hz > 0
+    assert cfg.motor_command_ttl_seconds > 0
+    assert cfg.autonomous_clear_frames_required >= 1
+    assert cfg.pan_pid_kp > 0
+    assert cfg.tilt_pid_kp > 0
+    assert cfg.tracking_deadband_px > 0
+    assert cfg.follow_pan_align_threshold_deg > 0
+    assert cfg.kalman_max_prediction_frames == 30
+    assert cfg.kalman_process_noise > 0
+    assert cfg.kalman_measurement_noise > 0
+    assert cfg.detector_tracking_iou > 0
+    assert cfg.resolved_tracker_config_path.name == "rover_botsort.yaml"
     assert cfg.audio_sample_rate > 0
     assert cfg.key_repeat_hz > 0
     assert cfg.stt_backend
@@ -26,6 +51,21 @@ def test_url_fields_are_strings():
     assert DUMMY_CONFIG.vision_stream_url.startswith(("ws://", "wss://", "http://", "https://"))
     assert DUMMY_CONFIG.servo_url.startswith("ws://")
     assert DUMMY_CONFIG.motor_url.startswith("ws://")
+
+
+def test_build_rover_config_defaults_to_shared_jarvis_websocket():
+    cfg = build_rover_config("rtx5060")
+
+    assert cfg.servo_url.endswith("/Jarvis")
+    assert cfg.motor_url.endswith("/Jarvis")
+    assert cfg.servo_url == cfg.motor_url
+
+
+def test_build_rover_config_uses_separate_default_camera_ip():
+    cfg = build_rover_config("rtx5060")
+
+    assert cfg.vision_stream_url == "http://192.168.137.100:81/stream"
+    assert cfg.servo_url == "ws://198.168.137.101:80/Jarvis"
 
 
 def test_legacy_yolo_properties_map_to_detector_fields():
@@ -42,6 +82,12 @@ def test_knowledge_paths_resolve_relative_to_project_root():
     assert all(isinstance(path, Path) for path in resolved)
     assert all(path.is_absolute() for path in resolved)
     assert resolved[0].parent == PROJECT_ROOT
+
+
+def test_tracker_config_resolves_relative_to_project_root():
+    resolved = DUMMY_CONFIG.resolved_tracker_config_path
+    assert resolved.is_absolute()
+    assert resolved.parent == PROJECT_ROOT / "trackers"
 
 
 def test_build_rover_config_uses_mx330_profile_defaults():
@@ -61,9 +107,12 @@ def test_build_rover_config_uses_rtx5060_profile_defaults():
     assert cfg.performance_profile == "rtx5060"
     assert cfg.vision_loop_hz == 60
     assert cfg.ui_frame_hz == 60
-    assert cfg.detection_hz == 24
+    assert cfg.detection_hz == 30
     assert cfg.snapshot_poll_hz == 30
     assert cfg.detector_input_width == 960
+    assert cfg.detector_device == "cuda:0"
+    assert cfg.detector_confidence == 0.30
+    assert cfg.servo_send_hz == 30
 
 
 def test_build_rover_config_falls_back_to_mx330_for_unknown_profile():

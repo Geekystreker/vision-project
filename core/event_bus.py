@@ -1,9 +1,9 @@
 import threading
-from typing import Callable, Dict, List, Any
+from typing import Any, Callable
 
 class EventBus:
     """
-    A simple thread-safe synchronous/asynchronous Event Bus for decoupling modules from the UI.
+    A simple thread-safe synchronous event bus for decoupling modules from the UI.
     Modules emit generic strings for topics, UI or other modules subscribe to callbacks.
     """
     _instance = None

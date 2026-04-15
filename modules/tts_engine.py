@@ -1,12 +1,11 @@
 import queue
 import time
 import threading
-import os
-import site
 from pathlib import Path
 
 import numpy as np
 import pyaudio
+from runtime_preload import preload_onnxruntime
 
 # Piper model path relative to project root
 _MODEL_DIR = Path(__file__).resolve().parent.parent / "models"
@@ -23,6 +22,7 @@ class TTSEngine:
     _instance = None
     _lock = threading.Lock()
     _queue: queue.Queue = queue.Queue()
+    _queued_texts: set[str] = set()
     _is_speaking: bool = False
     _cancel_current: bool = False
     _current_text: str = ""
@@ -48,20 +48,32 @@ class TTSEngine:
             cls._safe_call(on_done)
             return
 
+        line = " ".join(str(text).split())
+        if not line:
+            cls._safe_call(on_start)
+            cls._safe_call(on_done)
+            return
+
         with cls._lock:
-            if cls._is_speaking and cls._current_text == text:
-                # Do not interrupt or replay if we are already actively speaking this exact phrase
+            if (cls._is_speaking and cls._current_text == line) or line in cls._queued_texts:
                 cls._safe_call(on_done)
                 return
 
         if interrupt:
             cls.interrupt()
 
-        cls._queue.put((text, on_start, on_done))
+        with cls._lock:
+            cls._queued_texts.add(line)
+        cls._queue.put((line, on_start, on_done))
 
     @classmethod
     def is_speaking(cls) -> bool:
         return cls._is_speaking
+
+    @classmethod
+    def has_pending(cls) -> bool:
+        with cls._lock:
+            return cls._is_speaking or bool(cls._queued_texts)
 
     @classmethod
     def interrupt(cls):
@@ -69,6 +81,7 @@ class TTSEngine:
         with cls._lock:
             if cls._is_speaking:
                 cls._cancel_current = True
+            cls._queued_texts.clear()
             
         while not cls._queue.empty():
             try:
@@ -107,22 +120,8 @@ class TTSEngine:
     @classmethod
     def _run_piper_loop(cls):
         print("[TTS/Piper] Importing PiperVoice...")
-        if hasattr(os, "add_dll_directory"):
-            candidate_paths = []
-            for site_root in site.getsitepackages() + [site.getusersitepackages()]:
-                root = Path(site_root)
-                candidate_paths.extend(
-                    [
-                        root / "onnxruntime" / "capi",
-                        root / "onnxruntime.libs",
-                    ]
-                )
-            for path in candidate_paths:
-                if path.exists():
-                    try:
-                        os.add_dll_directory(str(path))
-                    except OSError:
-                        pass
+        if not preload_onnxruntime():
+            raise ImportError("onnxruntime preload failed")
 
         import onnxruntime  # noqa: F401
         from piper import PiperVoice
@@ -135,28 +134,39 @@ class TTSEngine:
         print("[TTS/Piper] Ready. Waiting for queue...")
         while True:
             text, on_start, on_done = cls._queue.get()
-            
+
             with cls._lock:
+                cls._queued_texts.discard(text)
                 cls._is_speaking = True
                 cls._current_text = text
+                cls._cancel_current = False
                 
             cls._safe_call(on_start)
 
             try:
                 print(f"[TTS/Piper] Generating audio for: {text}")
-                stream = pa.open(
-                    format=pyaudio.paFloat32,
-                    channels=1,
-                    rate=voice.config.sample_rate,
-                    output=True,
-                )
+                audio_buffers: list[bytes] = []
                 for chunk in voice.synthesize(text):
                     if cls._cancel_current:
                         break
-                    stream.write(np.array(chunk.audio_float_array, dtype="float32").tobytes())
-                # DO NOT CALL stop_stream() - it causes deadlocks on Windows if interrupted
-                stream.close()
-                print(f"[TTS/Piper] Finished playing: {text}")
+                    samples = np.asarray(chunk.audio_float_array, dtype=np.float32)
+                    if samples.size:
+                        audio_buffers.append(samples.tobytes())
+
+                if not cls._cancel_current and audio_buffers:
+                    audio_blob = b"".join(audio_buffers)
+                    stream = pa.open(
+                        format=pyaudio.paFloat32,
+                        channels=1,
+                        rate=voice.config.sample_rate,
+                        output=True,
+                    )
+                    try:
+                        if not cls._cancel_current:
+                            stream.write(audio_blob)
+                    finally:
+                        stream.close()
+                    print(f"[TTS/Piper] Finished playing: {text}")
             except Exception as e:
                 print(f"[TTS/Piper] Error: {e}")
 
@@ -176,10 +186,12 @@ class TTSEngine:
 
         while True:
             text, on_start, on_done = cls._queue.get()
-            
+
             with cls._lock:
+                cls._queued_texts.discard(text)
                 cls._is_speaking = True
                 cls._current_text = text
+                cls._cancel_current = False
                 
             cls._safe_call(on_start)
 

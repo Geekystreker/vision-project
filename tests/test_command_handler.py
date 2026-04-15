@@ -11,3 +11,7 @@ def test_parse_scene_inspection_phrase():
 
 def test_parse_basic_drive_command():
     assert CommandHandler.parse_local_command("move forward") == "F"
+
+
+def test_parse_autonomous_phrase():
+    assert CommandHandler.parse_local_command("drive autonomously") == "AUTO"

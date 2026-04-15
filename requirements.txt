@@ -11,5 +11,6 @@ python-dotenv
 faster-whisper
 onnxruntime
 ultralytics
+lap>=0.5.12
 torch
 piper-tts

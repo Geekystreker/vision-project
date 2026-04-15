@@ -10,11 +10,13 @@ import numpy as np
 
 from config import RoverConfig
 from core.event_bus import SystemEvents, bus
+from modules.autonomous_controller import AutonomousController
 from modules.control_arbiter import ControlArbiter
 from modules.detection_engine import DetectionEngine
+from modules.hud_renderer import JarvisHUDRenderer
 from modules.motor_controller import MotorController
 from modules.rover_control import RoverController
-from modules.rover_types import BoundingBox, ConnectionState, ControlMode, Detection, VisionSnapshot
+from modules.rover_types import BoundingBox, ConnectionState, ConnectionStatus, ControlMode, Detection, VisionSnapshot
 from modules.scene_perception import ScenePerceptionService
 from modules.servo_controller import ServoController
 from modules.target_tracker import TargetTracker
@@ -34,12 +36,13 @@ class RoverVisionApp:
 
         self._last_good_frame: Optional[np.ndarray] = None
         self._last_decoded_payload: bytes | None = None
-        self._last_render_key = None
-        self._last_rendered_rgb: Optional[np.ndarray] = None
         self._latest_snapshot = VisionSnapshot(frame=None)
         self._last_command = "S"
         self._fps = 0.0
         self._last_loop = 0.0
+        self._latest_inference_ms = 0.0
+        self._latest_camera_frame: Optional[np.ndarray] = None
+        self._frame_handoff_lock = threading.Lock()
         self._latest_detections = []
         self._latest_target = None
         self._latest_detection_mode = ControlMode.IDLE
@@ -52,9 +55,14 @@ class RoverVisionApp:
         self._detection_event = threading.Event()
         self._detection_load_lock = threading.Lock()
         self._detection_state_lock = threading.Lock()
+        self._last_servo_connection_notice = 0.0
+        self._last_manual_servo_command_at = 0.0
+        self._camera_missing_notice_emitted = False
         self._link_states = {
             "camera": ConnectionState.DISCONNECTED,
+            "detector": ConnectionState.DISCONNECTED,
             "motor": ConnectionState.DISCONNECTED,
+            "ollama": ConnectionState.DISCONNECTED,
             "servo": ConnectionState.DISCONNECTED,
         }
 
@@ -64,6 +72,7 @@ class RoverVisionApp:
         self._rover_controller = RoverController()
         self._detection_engine = DetectionEngine(config)
         self._detection_loaded = False
+        self._last_detection_load_attempt = 0.0
         self._target_tracker = TargetTracker(config)
         self._tracking_controller = TrackingController(
             config,
@@ -71,6 +80,12 @@ class RoverVisionApp:
             self._servo_controller,
             self._motor_controller,
         )
+        self._autonomous_controller = AutonomousController(
+            config,
+            self._rover_controller,
+            self._motor_controller,
+        )
+        self._hud_renderer = JarvisHUDRenderer()
         self._scene_perception = ScenePerceptionService()
         self._lock = threading.Lock()
 
@@ -78,8 +93,9 @@ class RoverVisionApp:
 
     def run(self) -> None:
         self._running = True
-        self._vision_stream.start()
+        self._servo_controller.start()
         self._motor_controller.start()
+        self._vision_stream.start()
         threading.Thread(
             target=self._detection_loop,
             daemon=True,
@@ -135,29 +151,70 @@ class RoverVisionApp:
         self._last_command = cmd
         return True
 
-    def adjust_servo(self, *, pan_delta: int = 0, tilt_delta: int = 0, source: str = "KEYBOARD") -> tuple[int, int]:
+    def adjust_servo(self, *, pan_delta: float = 0, tilt_delta: float = 0, source: str = "KEYBOARD") -> tuple[int, int]:
         if source == "KEYBOARD":
             self._arbiter.begin_keyboard_override()
         elif source != "VOICE":
             self._arbiter.begin_keyboard_override()
         elif not self._arbiter.allow_voice():
             return 90, 90
-        return self._tracking_controller.manual_pan_tilt(pan_delta=pan_delta, tilt_delta=tilt_delta)
+        min_interval = max(0.03, 1.0 / max(1, self._config.servo_send_hz))
+        now = time.monotonic()
+        if source == "KEYBOARD" and (now - self._last_manual_servo_command_at) < min_interval:
+            return self._tracking_controller.current_angles()
+        pan, tilt = self._tracking_controller.manual_pan_tilt(pan_delta=pan_delta, tilt_delta=tilt_delta)
+        self._last_manual_servo_command_at = now
+        is_connected = getattr(self._servo_controller, "is_connected", lambda: True)
+        if not is_connected():
+            if (now - self._last_servo_connection_notice) >= 2.0:
+                self._last_servo_connection_notice = now
+                bus.emit(
+                    SystemEvents.LOG_MESSAGE,
+                    "[Control] Servo command queued. Waiting for the ESP32 Jarvis websocket to connect.",
+                )
+        else:
+            bus.emit(SystemEvents.LOG_MESSAGE, f"[Control] Servo moved to pan {pan}, tilt {tilt}.")
+        return pan, tilt
 
     def toggle_follow_mode(self) -> ControlMode:
         mode = self._arbiter.toggle_follow_mode()
         if mode != ControlMode.FOLLOW_PERSON:
             self._tracking_controller.reset()
+            self._autonomous_controller.reset()
             self._target_tracker.clear()
             self._last_command = "S"
         return mode
 
+    def toggle_autonomous_mode(self) -> ControlMode:
+        mode = self._arbiter.toggle_autonomous_mode()
+        if mode != ControlMode.AUTONOMOUS:
+            self._autonomous_controller.reset()
+            self._last_command = "S"
+        else:
+            self._tracking_controller.reset()
+            self._target_tracker.clear()
+        return mode
+
+    def engage_autonomous_target_lock(self) -> ControlMode:
+        self._tracking_controller.reset()
+        self._autonomous_controller.reset()
+        self._target_tracker.clear()
+        self._last_command = "S"
+        mode = self._arbiter.set_autonomous_mode()
+        self._log_autonomous_readiness()
+        return mode
+
     def set_follow_mode(self) -> ControlMode:
+        self._autonomous_controller.reset()
         return self._arbiter.set_follow_mode()
+
+    def set_autonomous_mode(self) -> ControlMode:
+        return self.engage_autonomous_target_lock()
 
     def set_manual_mode(self) -> ControlMode:
         mode = self._arbiter.set_manual_mode()
         self._tracking_controller.reset()
+        self._autonomous_controller.reset()
         self._target_tracker.clear()
         self._last_command = "S"
         return mode
@@ -165,6 +222,7 @@ class RoverVisionApp:
     def emergency_stop(self) -> None:
         self.send_drive_command("S", source="E_STOP")
         self._tracking_controller.reset()
+        self._autonomous_controller.reset()
         self._target_tracker.clear()
 
     def describe_scene(self) -> str:
@@ -186,36 +244,24 @@ class RoverVisionApp:
             self._publish_snapshot(None, [], None, mode)
             return
 
-        if mode in {ControlMode.FOLLOW_PERSON, ControlMode.INSPECT_SCENE}:
-            self._schedule_detection(frame, mode)
-        elif self._latest_target is not None or self._latest_detections:
-            with self._detection_state_lock:
-                self._latest_detections = []
-                self._latest_target = None
-                self._latest_detection_mode = mode
-            if self._target_tracker.current_target() is not None:
-                self._target_tracker.clear()
+        self._camera_missing_notice_emitted = False
+
+        with self._frame_handoff_lock:
+            self._latest_camera_frame = frame.copy()
+
+        self._schedule_detection(mode)
 
         with self._detection_state_lock:
             detections = list(self._latest_detections)
             target = self._latest_target
 
-        if mode == ControlMode.FOLLOW_PERSON and self._vision_stream.frame_age() > self._config.frame_stale_seconds:
+        if mode in {ControlMode.FOLLOW_PERSON, ControlMode.AUTONOMOUS} and self._vision_stream.frame_age() > self._config.frame_stale_seconds:
             self._tracking_controller.reset()
+            self._autonomous_controller.reset()
             self._last_command = "S"
 
-        render_key = self._build_render_key(raw, detections, target, mode)
-        if render_key == self._last_render_key and self._last_rendered_rgb is not None:
-            rgb = self._last_rendered_rgb
-        else:
-            needs_overlay = bool(detections) or target is not None or mode in {
-                ControlMode.FOLLOW_PERSON,
-                ControlMode.INSPECT_SCENE,
-            }
-            display = self._render_overlay(frame.copy(), detections, target, mode) if needs_overlay else frame
-            rgb = cv2.cvtColor(display, cv2.COLOR_BGR2RGB)
-            self._last_render_key = render_key
-            self._last_rendered_rgb = rgb
+        display = self._render_overlay(frame.copy(), detections, target, mode)
+        rgb = cv2.cvtColor(display, cv2.COLOR_BGR2RGB)
         self._publish_snapshot(rgb, detections, target, mode)
 
     def _handle_missing_frame(self, mode: ControlMode) -> None:
@@ -226,18 +272,36 @@ class RoverVisionApp:
             self._latest_target = None
             self._detection_frame = None
             self._detection_busy = False
-        self._last_render_key = None
-        self._last_rendered_rgb = None
-        if mode == ControlMode.FOLLOW_PERSON:
+        with self._frame_handoff_lock:
+            self._latest_camera_frame = None
+        if mode in {ControlMode.FOLLOW_PERSON, ControlMode.AUTONOMOUS}:
             self._tracking_controller.reset()
+            self._autonomous_controller.reset()
             self._last_command = "S"
+        elif (
+            not self._camera_missing_notice_emitted
+            and (
+                self._link_states.get("motor") == ConnectionState.CONNECTED
+                or self._link_states.get("servo") == ConnectionState.CONNECTED
+            )
+        ):
+            self._camera_missing_notice_emitted = True
+            bus.emit(
+                SystemEvents.LOG_MESSAGE,
+                "[RoverVisionApp] Camera unavailable. Driver node controls remain online for manual drive/servo.",
+            )
 
-    def _schedule_detection(self, frame: np.ndarray, mode: ControlMode) -> None:
+    def _schedule_detection(self, mode: ControlMode) -> None:
         now = time.monotonic()
         if self._detection_busy:
             return
         if (now - self._last_detection_submit) < self._detection_interval:
             return
+
+        with self._frame_handoff_lock:
+            if self._latest_camera_frame is None:
+                return
+            frame = self._latest_camera_frame.copy()
 
         detect_frame = frame
         scale_x = 1.0
@@ -273,29 +337,59 @@ class RoverVisionApp:
                 self._detection_frame = None
                 self._detection_event.clear()
 
-            if frame is None or mode not in {ControlMode.FOLLOW_PERSON, ControlMode.INSPECT_SCENE}:
+            if frame is None:
                 with self._detection_state_lock:
                     self._detection_busy = False
                 continue
 
-            self._ensure_detection_loaded()
-            detections = self._detection_engine.detect(frame)
-            if scale_x != 1.0 or scale_y != 1.0:
-                detections = [self._scale_detection(det, scale_x, scale_y, frame_w, frame_h) for det in detections]
+            detections: list[Detection] = []
             target = None
+            try:
+                self._ensure_detection_loaded()
+                if self._detection_loaded:
+                    inference_started = time.monotonic()
+                    detections = self._detection_engine.detect(frame)
+                    self._latest_inference_ms = (time.monotonic() - inference_started) * 1000.0
+                else:
+                    self._latest_inference_ms = 0.0
 
-            if mode == ControlMode.FOLLOW_PERSON:
-                target = self._target_tracker.update(detections)
-                if self._arbiter.allow_autonomy():
-                    self._last_command = self._tracking_controller.update(target, frame_w, frame_h)
-            else:
-                if self._target_tracker.current_target() is not None:
-                    self._target_tracker.clear()
+                if scale_x != 1.0 or scale_y != 1.0:
+                    detections = [self._scale_detection(det, scale_x, scale_y, frame_w, frame_h) for det in detections]
+                target = self._target_tracker.update(detections, frame_w, frame_h)
+                bus.emit(SystemEvents.DETECTIONS_UPDATED, detections)
+                if not detections:
+                    bus.emit(SystemEvents.ROVER_NO_DETECTION, None)
+                self._apply_detection_actions(mode, target, detections, frame_w, frame_h)
+            except Exception as exc:
+                self._latest_inference_ms = 0.0
+                bus.emit(SystemEvents.LOG_MESSAGE, f"[RoverVisionApp] detection loop error: {exc}")
+            finally:
+                with self._detection_state_lock:
+                    self._latest_detections = list(detections)
+                    self._latest_target = target
+                    self._detection_busy = False
 
-            with self._detection_state_lock:
-                self._latest_detections = list(detections)
-                self._latest_target = target
-                self._detection_busy = False
+    def _apply_detection_actions(
+        self,
+        mode: ControlMode,
+        target,
+        detections: list[Detection],
+        frame_w: int,
+        frame_h: int,
+    ) -> None:
+        if mode == ControlMode.FOLLOW_PERSON:
+            if self._arbiter.allow_autonomy():
+                self._last_command = self._tracking_controller.update(target, frame_w, frame_h)
+            return
+
+        if mode == ControlMode.AUTONOMOUS:
+            if self._arbiter.allow_autonomy():
+                self._tracking_controller.update_servos(target, frame_w, frame_h)
+                self._last_command = self._autonomous_controller.update(detections, frame_w, frame_h)
+            return
+
+        if mode != ControlMode.INSPECT_SCENE and self._tracking_controller.target_locked():
+            self._tracking_controller.clear_lock_state()
 
     @staticmethod
     def _scale_detection(detection: Detection, scale_x: float, scale_y: float, max_w: int, max_h: int) -> Detection:
@@ -336,11 +430,23 @@ class RoverVisionApp:
     def _ensure_detection_loaded(self) -> None:
         if self._detection_loaded:
             return
+        now = time.monotonic()
+        if (now - self._last_detection_load_attempt) < 3.0:
+            return
         with self._detection_load_lock:
             if self._detection_loaded:
                 return
+            if (now - self._last_detection_load_attempt) < 3.0:
+                return
+            self._last_detection_load_attempt = now
             self._detection_engine.load()
-            self._detection_loaded = True
+            self._detection_loaded = self._detection_engine.ready()
+            detector_state = ConnectionState.CONNECTED if self._detection_loaded else ConnectionState.ERROR
+            detail = "loaded" if self._detection_loaded else "not loaded"
+            bus.emit(
+                SystemEvents.CONNECTION_STATUS_CHANGED,
+                ConnectionStatus(channel="detector", state=detector_state, detail=detail),
+            )
 
     def _preload_detection(self) -> None:
         try:
@@ -348,93 +454,28 @@ class RoverVisionApp:
         except Exception as exc:
             bus.emit(SystemEvents.LOG_MESSAGE, f"[RoverVisionApp] detector preload failed: {exc}")
 
-    def _build_render_key(self, raw, detections, target, mode: ControlMode):
-        detection_key = tuple(
-            (
-                det.label,
-                round(det.confidence, 3),
-                det.bbox.x,
-                det.bbox.y,
-                det.bbox.w,
-                det.bbox.h,
-                det.track_id,
-            )
-            for det in detections
-        )
-        target_key = None
-        if target is not None:
-            bbox = target.bbox
-            target_key = (
-                target.target_id,
-                bbox.x,
-                bbox.y,
-                bbox.w,
-                bbox.h,
-            )
-        return (
-            id(raw),
-            mode.value,
-            self._last_command,
-            detection_key,
-            target_key,
-        )
-
     def _render_overlay(self, frame: np.ndarray, detections, target, mode: ControlMode) -> np.ndarray:
-        h, w = frame.shape[:2]
-        if mode in {ControlMode.FOLLOW_PERSON, ControlMode.INSPECT_SCENE}:
-            self._draw_reticle(frame, w // 2, h // 2, active=target is not None)
-
-        for det in detections:
-            color = (84, 188, 255)
-            if target and det.bbox == target.bbox:
-                color = (80, 255, 170)
-            x, y, bw, bh = det.bbox.x, det.bbox.y, det.bbox.w, det.bbox.h
-            cv2.rectangle(frame, (x, y), (x + bw, y + bh), color, 2)
-            label = f"{det.label.upper()} {int(det.confidence * 100)}%"
-            (text_w, text_h), _ = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.45, 1)
-            chip_top = max(0, y - text_h - 12)
-            chip_bottom = max(text_h + 8, y)
-            chip_right = min(w - 1, x + text_w + 12)
-            cv2.rectangle(frame, (x, chip_top), (chip_right, chip_bottom), color, -1)
-            cv2.putText(
-                frame,
-                label,
-                (x + 6, chip_bottom - 6),
-                cv2.FONT_HERSHEY_SIMPLEX,
-                0.45,
-                (6, 14, 24),
-                1,
-                cv2.LINE_AA,
-            )
-
-        if target:
-            cx = int(target.bbox.center_x)
-            cy = int(target.bbox.center_y)
-            cv2.circle(frame, (cx, cy), 7, (32, 255, 96), 2)
-            cv2.putText(
-                frame,
-                f"TRACK #{target.target_id}",
-                (max(12, target.bbox.x), max(22, target.bbox.y - 12)),
-                cv2.FONT_HERSHEY_SIMPLEX,
-                0.50,
-                (32, 255, 96),
-                1,
-                cv2.LINE_AA,
-            )
-
-        return frame
-
-    @staticmethod
-    def _draw_reticle(frame: np.ndarray, cx: int, cy: int, active: bool = False) -> None:
-        color = (92, 150, 188) if not active else (86, 222, 255)
-        gap = 16
-        arm = 46
-        thickness = 1 if not active else 2
-        cv2.line(frame, (cx - arm, cy), (cx - gap, cy), color, thickness, cv2.LINE_AA)
-        cv2.line(frame, (cx + gap, cy), (cx + arm, cy), color, thickness, cv2.LINE_AA)
-        cv2.line(frame, (cx, cy - arm), (cx, cy - gap), color, thickness, cv2.LINE_AA)
-        cv2.line(frame, (cx, cy + gap), (cx, cy + arm), color, thickness, cv2.LINE_AA)
-        cv2.circle(frame, (cx, cy), 8, color, 1, cv2.LINE_AA)
+        servo_pan, servo_tilt = self._tracking_controller.current_angles()
+        target_coords = None
+        if target is not None:
+            target_coords = (int(target.bbox.center_x), int(target.bbox.center_y))
+        predicted_coords = self._tracking_controller.predicted_point()
+        predicted_path = self._tracking_controller.prediction_path()
+        telemetry = {
+            "fps": self._fps,
+            "source_fps": self._vision_stream.source_fps(),
+            "inference_ms": self._latest_inference_ms,
+            "servo_pan": servo_pan,
+            "servo_tilt": servo_tilt,
+            "target_coords": target_coords,
+            "predicted_target_coords": predicted_coords,
+            "predicted_target_path": predicted_path,
+            "network_latency_ms": self._tracking_controller.latency_ms(),
+            "target_locked": self._tracking_controller.target_locked(),
+            "locked_target_id": self._target_tracker.locked_target_id(),
+            "last_command": self._last_command,
+        }
+        return self._hud_renderer.render(frame, list(detections), target, mode, telemetry)
 
     def _publish_snapshot(self, frame, detections, target, mode: ControlMode) -> None:
         now = time.monotonic()
@@ -442,6 +483,11 @@ class RoverVisionApp:
             dt = max(1e-3, now - self._last_loop)
             self._fps = (0.85 * self._fps) + (0.15 * (1.0 / dt)) if self._fps else (1.0 / dt)
         self._last_loop = now
+        servo_pan, servo_tilt = self._tracking_controller.current_angles()
+        target_coords = None
+        if target is not None:
+            target_coords = (int(target.bbox.center_x), int(target.bbox.center_y))
+        predicted_coords = self._tracking_controller.predicted_point()
 
         snapshot = VisionSnapshot(
             frame=frame,
@@ -450,7 +496,16 @@ class RoverVisionApp:
             mode=mode,
             fps=self._fps,
             source_fps=self._vision_stream.source_fps(),
+            inference_ms=self._latest_inference_ms,
             last_command=self._last_command,
+            servo_pan=servo_pan,
+            servo_tilt=servo_tilt,
+            target_coords=target_coords,
+            predicted_target_coords=predicted_coords,
+            predicted_target_path=self._tracking_controller.prediction_path(),
+            network_latency_ms=self._tracking_controller.latency_ms(),
+            target_locked=self._tracking_controller.target_locked(),
+            locked_target_id=self._target_tracker.locked_target_id(),
             links=self._link_states.copy(),
         )
         with self._lock:
@@ -464,3 +519,20 @@ class RoverVisionApp:
         state = getattr(status, "state", None)
         if channel in self._link_states and state is not None:
             self._link_states[channel] = state
+
+    def _log_autonomous_readiness(self) -> None:
+        missing = [
+            channel
+            for channel in ("camera", "detector", "servo", "motor")
+            if self._link_states.get(channel) != ConnectionState.CONNECTED
+        ]
+        if missing:
+            bus.emit(
+                SystemEvents.LOG_MESSAGE,
+                "[Autonomous] Target-lock mode armed. Waiting on: " + ", ".join(missing) + ".",
+            )
+            return
+        bus.emit(
+            SystemEvents.LOG_MESSAGE,
+            "[Autonomous] Target-lock mode engaged. YOLO will lock target and keep servos centered.",
+        )

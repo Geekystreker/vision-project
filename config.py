@@ -20,10 +20,13 @@ DEFAULT_KNOWLEDGE_PATHS = (
     "config.py",
     "modules",
 )
-DEFAULT_ESP32_IP = os.getenv("ROVER_ESP32_IP", "192.168.137.110")
-DEFAULT_CAMERA_STREAM_URL = os.getenv("ROVER_CAMERA_STREAM_URL", f"http://{DEFAULT_ESP32_IP}:81/stream")
-DEFAULT_SERVO_WS_URL = os.getenv("ROVER_SERVO_WS_URL", f"ws://{DEFAULT_ESP32_IP}/ServoInput")
-DEFAULT_MOTOR_WS_URL = os.getenv("ROVER_MOTOR_WS_URL", "")
+DEFAULT_TRACKER_CONFIG = "trackers/rover_botsort.yaml"
+DEFAULT_ESP32_IP = os.getenv("ROVER_ESP32_IP", "198.168.137.101")
+DEFAULT_CAMERA_IP = os.getenv("ROVER_CAMERA_IP", "192.168.137.100")
+DEFAULT_CAMERA_STREAM_URL = os.getenv("ROVER_CAMERA_STREAM_URL", f"http://{DEFAULT_CAMERA_IP}:81/stream")
+DEFAULT_JARVIS_WS_URL = f"ws://{DEFAULT_ESP32_IP}:80/Jarvis"
+DEFAULT_SERVO_WS_URL = os.getenv("ROVER_SERVO_WS_URL", DEFAULT_JARVIS_WS_URL)
+DEFAULT_MOTOR_WS_URL = os.getenv("ROVER_MOTOR_WS_URL", DEFAULT_JARVIS_WS_URL)
 DEFAULT_PERFORMANCE_PROFILE = (os.getenv("VISION_PERF_PROFILE", "rtx5060") or "rtx5060").strip().lower()
 
 
@@ -52,14 +55,31 @@ class RoverConfig:
     ui_frame_hz: int = 30
     detection_hz: int = 8
     snapshot_poll_hz: int = 12
-    key_repeat_hz: int = 15
+    key_repeat_hz: int = 30
     frame_stale_seconds: float = 2.5
     camera_disconnect_timeout: float = 1.0
     camera_initial_frame_timeout: float = 8.0
     camera_reconnect_timeout: float = 12.0
 
     # Manual pan / tilt
-    servo_step: int = 5
+    servo_step: float = 1.0
+    servo_center_angle: int = 90
+    servo_min_angle: int = 10
+    servo_max_angle: int = 170
+    servo_pan_min_angle: int = 10
+    servo_pan_max_angle: int = 170
+    servo_tilt_min_angle: int = 10
+    servo_tilt_max_angle: int = 155
+    servo_manual_pan_direction: int = -1
+    servo_manual_tilt_direction: int = -1
+    servo_send_hz: int = 24
+    servo_max_step_deg: float = 4.0
+    servo_max_speed_deg_per_sec: float = 95.0
+    servo_min_delta_deg: float = 0.75
+    motor_drive_speed: int = 170
+    motor_turn_speed: int = 150
+    motor_send_hz: int = 20
+    motor_command_ttl_seconds: float = 0.35
 
     # Follow-person tracking
     dead_zone_px: int = 30
@@ -69,6 +89,31 @@ class RoverConfig:
     no_detection_timeout: float = 2.0
     max_target_lost_frames: int = 10
     track_iou_threshold: float = 0.20
+    duplicate_detection_iou_threshold: float = 0.72
+    target_lock_frames: int = 3
+    target_box_smoothing_alpha: float = 0.22
+    follow_pan_align_threshold_deg: float = 12.0
+    scene_announce_cooldown_seconds: float = 6.0
+    pid_integral_limit: float = 1.6
+    pan_pid_kp: float = 20.0
+    pan_pid_ki: float = 3.0
+    pan_pid_kd: float = 7.5
+    tilt_pid_kp: float = 18.0
+    tilt_pid_ki: float = 2.4
+    tilt_pid_kd: float = 6.0
+    tracking_deadband_px: int = 10
+    tracking_measurement_alpha: float = 0.35
+    kalman_max_prediction_frames: int = 30
+    kalman_process_noise: float = 35.0
+    kalman_measurement_noise: float = 90.0
+
+    # Autonomous navigation
+    autonomous_stop_fraction: float = 0.26
+    autonomous_turn_fraction: float = 0.12
+    autonomous_lane_margin: float = 0.025
+    autonomous_turn_hold_seconds: float = 0.55
+    autonomous_min_detection_fraction: float = 0.012
+    autonomous_clear_frames_required: int = 2
 
     # Transport
     ws_recv_timeout: float = 2.0
@@ -78,11 +123,15 @@ class RoverConfig:
     detector_backend: str = "yolo26"
     detector_model: str = "yolo26n.pt"
     detector_fallback_model: str = "yolov8n.pt"
-    detector_confidence: float = 0.50
+    detector_confidence: float = 0.30
+    detector_tracking_confidence: float = 0.30
+    detector_tracking_iou: float = 0.55
     detector_device: str = "auto"
     detector_half_precision: bool = True
     detector_max_detections: int = 6
     detector_input_width: int = 416
+    detector_track_classes: tuple[int, ...] | None = None
+    detector_tracker_config: str = DEFAULT_TRACKER_CONFIG
     target_label: str = "person"
 
     # Audio
@@ -90,7 +139,8 @@ class RoverConfig:
     audio_chunk_size: int = 1_024
     speech_activation_threshold: float = 0.02
     speech_silence_seconds: float = 0.90
-    clap_amplitude_threshold: float = 0.18
+    clap_amplitude_threshold: float = 0.12
+    clap_min_separation_seconds: float = 0.16
     clap_window_seconds: float = 0.85
     clap_cooldown_seconds: float = 2.0
 
@@ -131,6 +181,13 @@ class RoverConfig:
             paths.append(path)
         return tuple(paths)
 
+    @property
+    def resolved_tracker_config_path(self) -> Path:
+        path = Path(self.detector_tracker_config)
+        if not path.is_absolute():
+            path = PROJECT_ROOT / path
+        return path
+
 
 PERFORMANCE_PROFILES: dict[str, dict[str, int | float | str]] = {
     "mx330": {
@@ -145,9 +202,25 @@ PERFORMANCE_PROFILES: dict[str, dict[str, int | float | str]] = {
         "performance_profile": "rtx5060",
         "vision_loop_hz": 60,
         "ui_frame_hz": 60,
-        "detection_hz": 24,
+        "detection_hz": 30,
         "snapshot_poll_hz": 30,
         "detector_input_width": 960,
+        "detector_device": "cuda:0",
+        "detector_confidence": 0.30,
+        "detector_tracking_iou": 0.60,
+        "servo_send_hz": 30,
+        "servo_max_step_deg": 4.6,
+        "servo_max_speed_deg_per_sec": 105.0,
+        "pan_pid_kp": 22.0,
+        "pan_pid_ki": 2.2,
+        "pan_pid_kd": 9.5,
+        "tilt_pid_kp": 18.0,
+        "tilt_pid_ki": 1.8,
+        "tilt_pid_kd": 8.4,
+        "tracking_deadband_px": 10,
+        "kalman_max_prediction_frames": 30,
+        "kalman_process_noise": 30.0,
+        "kalman_measurement_noise": 75.0,
     },
 }
 

@@ -1,8 +1,9 @@
 from __future__ import annotations
 
 import threading
+import time
 
-from PyQt5.QtCore import QObject, Qt, QTimer, pyqtSignal
+from PyQt5.QtCore import QEvent, QObject, Qt, QTimer, pyqtSignal
 from PyQt5.QtGui import QImage, QPixmap
 from PyQt5.QtWidgets import (
     QFrame,
@@ -12,6 +13,7 @@ from PyQt5.QtWidgets import (
     QLineEdit,
     QMainWindow,
     QPushButton,
+    QApplication,
     QSizePolicy,
     QTextEdit,
     QVBoxLayout,
@@ -131,6 +133,24 @@ class JarvisHUD(QMainWindow):
         Qt.Key_Down: "__TILT_DOWN__",
     }
 
+    NATIVE_SERVO_KEY_MAP = {
+        37: "__PAN_LEFT__",
+        39: "__PAN_RIGHT__",
+        38: "__TILT_UP__",
+        40: "__TILT_DOWN__",
+    }
+
+    NATIVE_SCAN_SERVO_KEY_MAP = {
+        72: "__TILT_UP__",
+        75: "__PAN_LEFT__",
+        77: "__PAN_RIGHT__",
+        80: "__TILT_DOWN__",
+        328: "__TILT_UP__",
+        331: "__PAN_LEFT__",
+        333: "__PAN_RIGHT__",
+        336: "__TILT_DOWN__",
+    }
+
     def __init__(self, request_handler_callback, config: RoverConfig | None = None):
         super().__init__()
         self.request_handler = request_handler_callback
@@ -139,10 +159,11 @@ class JarvisHUD(QMainWindow):
         self.bridge = UIEventBridge(frame_hz=frame_hz)
 
         self._pressed_drive_keys: set[int] = set()
-        self._pressed_servo_keys: set[int] = set()
-        self._key_timestamps: dict[int, int] = {}
+        self._pressed_servo_keys: set[str] = set()
+        self._key_timestamps: dict[object, int] = {}
         self._key_counter = 0
         self._last_drive_command = "S"
+        self._last_key_debug_at = 0.0
 
         self._build_ui()
         self.setStyleSheet(JARVIS_THEME)
@@ -154,6 +175,9 @@ class JarvisHUD(QMainWindow):
         self.bridge.frame_signal.connect(self._update_frame)
         self.bridge.mode_signal.connect(self._update_mode)
         self.bridge.connection_signal.connect(self._update_connections)
+        app = QApplication.instance()
+        if app is not None:
+            app.installEventFilter(self)
 
         self._input_timer = QTimer(self)
         key_repeat_hz = self._config.key_repeat_hz if self._config is not None else 15
@@ -176,7 +200,7 @@ class JarvisHUD(QMainWindow):
         title_stack = QVBoxLayout()
         title = QLabel("V.I.S.I.O.N CONTROL PANEL")
         title.setObjectName("titleLabel")
-        subtitle = QLabel("Local AI rover operator for manual drive, follow mode, and scene awareness")
+        subtitle = QLabel("Local AI rover operator for manual drive, autonomous mode, follow mode, and scene awareness")
         subtitle.setObjectName("subtitleLabel")
         title_stack.addWidget(title)
         title_stack.addWidget(subtitle)
@@ -231,18 +255,24 @@ class JarvisHUD(QMainWindow):
         self.camera_chip = QLabel("CAM OFFLINE")
         self.motor_chip = QLabel("MOTOR OFFLINE")
         self.servo_chip = QLabel("SERVO OFFLINE")
-        for widget in (self.camera_chip, self.motor_chip, self.servo_chip):
+        self.detector_chip = QLabel("YOLO OFFLINE")
+        self.ollama_chip = QLabel("OLLAMA OFFLINE")
+        for widget in (self.camera_chip, self.motor_chip, self.servo_chip, self.detector_chip, self.ollama_chip):
             widget.setObjectName("chip")
             chips.addWidget(widget)
         layout.addLayout(chips)
 
         actions = QHBoxLayout()
+        self.auto_btn = QPushButton("AUTO LOCK")
+        self.auto_btn.setCheckable(True)
+        self.auto_btn.clicked.connect(lambda: self.request_handler("__ENGAGE_AUTONOMOUS__", is_raw_command=True))
         self.follow_btn = QPushButton("FOLLOW")
         self.follow_btn.setCheckable(True)
         self.follow_btn.clicked.connect(lambda: self.request_handler("__TOGGLE_FOLLOW__", is_raw_command=True))
         self.estop_btn = QPushButton("E-STOP")
         self.estop_btn.setObjectName("dangerButton")
         self.estop_btn.clicked.connect(lambda: self.request_handler("__E_STOP__", is_raw_command=True))
+        actions.addWidget(self.auto_btn)
         actions.addWidget(self.follow_btn)
         actions.addWidget(self.estop_btn)
         layout.addLayout(actions)
@@ -264,12 +294,16 @@ class JarvisHUD(QMainWindow):
         self.last_cmd_value = QLabel("S")
         self.fps_value = QLabel("0.0")
         self.target_value = QLabel("NONE")
+        self.servo_value = QLabel("090 / 090")
+        self.latency_value = QLabel("0.0 ms")
 
         metrics = [
             ("MOTION", self.motion_value),
             ("LAST CMD", self.last_cmd_value),
             ("FPS R/C", self.fps_value),
             ("TARGET", self.target_value),
+            ("SERVO", self.servo_value),
+            ("NET LAT", self.latency_value),
         ]
         for row, (label_text, value_label) in enumerate(metrics, start=1):
             key = QLabel(label_text)
@@ -298,16 +332,25 @@ class JarvisHUD(QMainWindow):
         self.camera_cmd_badge.setObjectName("cameraHudBadge")
         self.camera_fps_badge = QLabel("FPS 0.0 / 0.0")
         self.camera_fps_badge.setObjectName("cameraHudBadge")
+        self.camera_ai_badge = QLabel("AI 0.0 ms")
+        self.camera_ai_badge.setObjectName("cameraHudBadge")
         self.camera_link_badge = QLabel("CAM OFFLINE")
         self.camera_link_badge.setObjectName("cameraHudBadge")
         self.camera_target_badge = QLabel("TARGET NONE")
         self.camera_target_badge.setObjectName("cameraHudBadge")
+        self.camera_servo_badge = QLabel("SERVO 090/090")
+        self.camera_servo_badge.setObjectName("cameraHudBadge")
+        self.camera_latency_badge = QLabel("NET 0.0 ms")
+        self.camera_latency_badge.setObjectName("cameraHudBadge")
         for widget in (
             self.camera_mode_badge,
             self.camera_cmd_badge,
             self.camera_fps_badge,
+            self.camera_ai_badge,
             self.camera_link_badge,
             self.camera_target_badge,
+            self.camera_servo_badge,
+            self.camera_latency_badge,
         ):
             hud_strip.addWidget(widget)
         hud_strip.addStretch(1)
@@ -323,7 +366,7 @@ class JarvisHUD(QMainWindow):
         layout.addLayout(feed_row, 1)
 
         self.camera_caption = QLabel(
-            "640x480 optimized live view (4:3). W/A/S/D drive, arrows pan/tilt, T follow, Space E-stop"
+            "640x480 optimized live view (4:3). W/A/S/D drive, arrows pan/tilt, P auto, T follow, Space E-stop"
         )
         self.camera_caption.setObjectName("cameraCaption")
         layout.addWidget(self.camera_caption)
@@ -393,6 +436,7 @@ class JarvisHUD(QMainWindow):
         mode = (mode or "IDLE").upper()
         self.mode_label.setText(mode)
         self.camera_mode_badge.setText(mode)
+        self.auto_btn.setChecked(mode == "AUTONOMOUS")
         self.follow_btn.setChecked(mode == "FOLLOW_PERSON")
 
     def _update_connections(self, status) -> None:
@@ -409,6 +453,10 @@ class JarvisHUD(QMainWindow):
             self.motor_chip.setText("MOTOR STANDBY" if "disabled" in detail else f"MOTOR {state_text}")
         elif channel == "servo":
             self.servo_chip.setText("SERVO STANDBY" if "disabled" in detail else f"SERVO {state_text}")
+        elif channel == "detector":
+            self.detector_chip.setText(f"YOLO {state_text}")
+        elif channel == "ollama":
+            self.ollama_chip.setText(f"OLLAMA {state_text}")
 
     def _update_telemetry(self, cmd: str) -> None:
         cmd = (cmd or "").upper()
@@ -429,11 +477,27 @@ class JarvisHUD(QMainWindow):
         frame = getattr(snapshot, "frame", None)
         render_fps = getattr(snapshot, "fps", 0.0)
         source_fps = getattr(snapshot, "source_fps", 0.0)
+        inference_ms = getattr(snapshot, "inference_ms", 0.0)
+        servo_pan = getattr(snapshot, "servo_pan", 90)
+        servo_tilt = getattr(snapshot, "servo_tilt", 90)
+        latency_ms = getattr(snapshot, "network_latency_ms", 0.0)
         self.fps_value.setText(f"{render_fps:.1f}/{source_fps:.1f}")
         self.camera_fps_badge.setText(f"FPS {render_fps:.1f} / {source_fps:.1f}")
+        self.camera_ai_badge.setText(f"AI {inference_ms:.1f} ms")
+        self.servo_value.setText(f"{servo_pan:03d} / {servo_tilt:03d}")
+        self.latency_value.setText(f"{latency_ms:.1f} ms")
+        self.camera_servo_badge.setText(f"SERVO {servo_pan:03d}/{servo_tilt:03d}")
+        self.camera_latency_badge.setText(f"NET {latency_ms:.1f} ms")
         target = getattr(snapshot, "target", None)
-        self.target_value.setText(f"#{target.target_id}" if target else "NONE")
-        self.camera_target_badge.setText(f"TARGET #{target.target_id}" if target else "TARGET NONE")
+        target_coords = getattr(snapshot, "target_coords", None)
+        if target_coords:
+            self.target_value.setText(f"{target_coords[0]}, {target_coords[1]}")
+        else:
+            self.target_value.setText("NONE")
+        if target:
+            self.camera_target_badge.setText("TARGET LOCKED")
+        else:
+            self.camera_target_badge.setText("TARGET NONE")
 
         if frame is None:
             self.camera_feed.show_placeholder("Waiting for ESP32-CAM stream...")
@@ -454,79 +518,170 @@ class JarvisHUD(QMainWindow):
             self.request_handler(text)
 
     def _dispatch_held_keys(self) -> None:
-        if self.input_box.hasFocus():
-            return
-
-        drive_key = self._most_recent_key(self._pressed_drive_keys)
-        if drive_key is not None:
-            command = self.DRIVE_KEY_MAP[drive_key]
-            self.request_handler(command, is_raw_command=True)
-            self._last_drive_command = command
-        elif self._last_drive_command != "S":
-            self.request_handler("S", is_raw_command=True)
-            self._last_drive_command = "S"
-
-        servo_key = self._most_recent_key(self._pressed_servo_keys)
-        if servo_key is not None:
-            self.request_handler(self.SERVO_KEY_MAP[servo_key], is_raw_command=True)
+        if not self.input_box.hasFocus():
+            drive_key = self._most_recent_key(self._pressed_drive_keys)
+            if drive_key is not None:
+                command = self.DRIVE_KEY_MAP[drive_key]
+                self.request_handler(command, is_raw_command=True)
+                self._last_drive_command = command
+            elif self._last_drive_command != "S":
+                self.request_handler("S", is_raw_command=True)
+                self._last_drive_command = "S"
+            servo_command = self._most_recent_servo_command()
+            if servo_command is not None:
+                self.request_handler(servo_command, is_raw_command=True)
 
     def keyPressEvent(self, event) -> None:
-        if self.input_box.hasFocus():
-            super().keyPressEvent(event)
-            return
-
-        key = event.key()
-        if event.isAutoRepeat():
-            event.accept()
-            return
-
-        if key == Qt.Key_M:
-            self.mic_btn.setChecked(not self.mic_btn.isChecked())
-            self._toggle_mic()
-            return
-        if key == Qt.Key_T:
-            self.request_handler("__TOGGLE_FOLLOW__", is_raw_command=True)
-            return
-        if key == Qt.Key_I:
-            self.request_handler("__INSPECT_SCENE__", is_raw_command=True)
-            return
-        if key == Qt.Key_Space:
-            self.request_handler("__E_STOP__", is_raw_command=True)
-            self._last_drive_command = "S"
-            return
-
-        if key in self.DRIVE_KEY_MAP:
-            self._pressed_drive_keys.add(key)
-            self._key_counter += 1
-            self._key_timestamps[key] = self._key_counter
-            event.accept()
-            return
-
-        if key in self.SERVO_KEY_MAP:
-            self._pressed_servo_keys.add(key)
-            self._key_counter += 1
-            self._key_timestamps[key] = self._key_counter
-            event.accept()
+        if self._handle_key_press(event):
             return
 
         super().keyPressEvent(event)
 
     def keyReleaseEvent(self, event) -> None:
-        key = event.key()
-        if event.isAutoRepeat():
-            event.accept()
-            return
-
-        self._pressed_drive_keys.discard(key)
-        self._pressed_servo_keys.discard(key)
-        if key in self.DRIVE_KEY_MAP and not self._pressed_drive_keys:
-            self.request_handler("S", is_raw_command=True)
-            self._last_drive_command = "S"
-            event.accept()
+        if self._handle_key_release(event):
             return
         super().keyReleaseEvent(event)
+
+    def eventFilter(self, watched, event) -> bool:
+        if not self.isVisible():
+            return super().eventFilter(watched, event)
+        if event.type() == QEvent.KeyPress:
+            if self._handle_key_press(event):
+                return True
+        elif event.type() == QEvent.KeyRelease:
+            if self._handle_key_release(event):
+                return True
+        return super().eventFilter(watched, event)
 
     def _most_recent_key(self, keys: set[int]) -> int | None:
         if not keys:
             return None
         return max(keys, key=lambda item: self._key_timestamps.get(item, 0))
+
+    def _is_global_control_key(self, key: int) -> bool:
+        return (
+            key in self.SERVO_KEY_MAP
+            or key in {Qt.Key_Space, Qt.Key_T, Qt.Key_P, Qt.Key_I, Qt.Key_M}
+        )
+
+    def _handle_key_press(self, event) -> bool:
+        key = event.key()
+        servo_command = self._resolve_servo_command(event)
+        if self.input_box.hasFocus() and not (servo_command is not None or self._is_global_control_key(key)):
+            return False
+
+        if event.isAutoRepeat():
+            event.accept()
+            return self._is_control_key(key) or servo_command is not None
+
+        self._debug_key_press(event)
+
+        if key == Qt.Key_M:
+            self.mic_btn.setChecked(not self.mic_btn.isChecked())
+            self._toggle_mic()
+            event.accept()
+            return True
+        if key == Qt.Key_T:
+            self.request_handler("__TOGGLE_FOLLOW__", is_raw_command=True)
+            event.accept()
+            return True
+        if key == Qt.Key_P:
+            self.request_handler("__TOGGLE_AUTONOMOUS__", is_raw_command=True)
+            event.accept()
+            return True
+        if key == Qt.Key_I:
+            self.request_handler("__INSPECT_SCENE__", is_raw_command=True)
+            event.accept()
+            return True
+        if key == Qt.Key_Space:
+            self.request_handler("__E_STOP__", is_raw_command=True)
+            self._last_drive_command = "S"
+            event.accept()
+            return True
+
+        if key in self.DRIVE_KEY_MAP:
+            self._pressed_drive_keys.add(key)
+            self._key_counter += 1
+            self._key_timestamps[key] = self._key_counter
+            self.request_handler(self.DRIVE_KEY_MAP[key], is_raw_command=True)
+            self._last_drive_command = self.DRIVE_KEY_MAP[key]
+            event.accept()
+            return True
+
+        if servo_command is not None:
+            self._pressed_servo_keys.add(servo_command)
+            self._key_counter += 1
+            self._key_timestamps[servo_command] = self._key_counter
+            self.request_handler(servo_command, is_raw_command=True)
+            event.accept()
+            return True
+        return False
+
+    def _handle_key_release(self, event) -> bool:
+        key = event.key()
+        servo_command = self._resolve_servo_command(event)
+        if event.isAutoRepeat():
+            event.accept()
+            return self._is_control_key(key) or servo_command is not None
+
+        self._pressed_drive_keys.discard(key)
+        if servo_command is not None:
+            self._pressed_servo_keys.discard(servo_command)
+        if key in self.DRIVE_KEY_MAP and not self._pressed_drive_keys:
+            self.request_handler("S", is_raw_command=True)
+            self._last_drive_command = "S"
+            event.accept()
+            return True
+        if servo_command is not None:
+            event.accept()
+            return True
+        return False
+
+    def _is_control_key(self, key: int) -> bool:
+        return (
+            key in self.DRIVE_KEY_MAP
+            or key in self.SERVO_KEY_MAP
+            or key in {Qt.Key_Space, Qt.Key_T, Qt.Key_P, Qt.Key_I, Qt.Key_M}
+        )
+
+    def _most_recent_servo_command(self) -> str | None:
+        if not self._pressed_servo_keys:
+            return None
+        return max(self._pressed_servo_keys, key=lambda item: self._key_timestamps.get(item, 0))
+
+    def _resolve_servo_command(self, event) -> str | None:
+        key = event.key()
+        native_virtual = 0
+        try:
+            native_virtual = int(event.nativeVirtualKey())
+        except Exception:
+            native_virtual = 0
+        if native_virtual in self.NATIVE_SERVO_KEY_MAP:
+            return self.NATIVE_SERVO_KEY_MAP[native_virtual]
+        native_scan = 0
+        try:
+            native_scan = int(event.nativeScanCode())
+        except Exception:
+            native_scan = 0
+        if native_scan in self.NATIVE_SCAN_SERVO_KEY_MAP:
+            return self.NATIVE_SCAN_SERVO_KEY_MAP[native_scan]
+        return self.SERVO_KEY_MAP.get(key)
+
+    def _debug_key_press(self, event) -> None:
+        now = time.monotonic()
+        if (now - self._last_key_debug_at) < 0.05:
+            return
+        self._last_key_debug_at = now
+        try:
+            native_virtual = int(event.nativeVirtualKey())
+        except Exception:
+            native_virtual = 0
+        try:
+            native_scan = int(event.nativeScanCode())
+        except Exception:
+            native_scan = 0
+        servo_command = self._resolve_servo_command(event) or "-"
+        bus.emit(
+            SystemEvents.LOG_MESSAGE,
+            f"[DEBUG KEYCODE] Qt={int(event.key())} NativeVK={native_virtual} Scan={native_scan} Servo={servo_command}",
+        )

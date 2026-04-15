@@ -7,7 +7,7 @@ import time
 from urllib.error import URLError
 from urllib.parse import urlparse
 from urllib.request import Request, urlopen
-from typing import Optional, Any
+from typing import Optional, Any, Callable
 
 import websocket
 
@@ -23,7 +23,6 @@ class VisionStream:
         self._url = url
         self._config = config
         self._parsed_url = urlparse(url)
-        self._scheme = self._parsed_url.scheme.lower()
         self._transport = self._detect_transport(url)
         self._snapshot_candidates = self._build_snapshot_candidates(url)
         self._lock = threading.Lock()
@@ -40,7 +39,6 @@ class VisionStream:
         self._http_stream: Optional[HTTPResponse] = None
         self._stale_logged = False
         self._feed_stale = False
-        self._reconnect_logged = False
         self._had_frames = False
         self._last_error_text = ""
         self._last_error_time = 0.0
@@ -135,7 +133,6 @@ class VisionStream:
             self._latest = payload
         self._last_frame_monotonic = now
         self._stale_logged = False
-        self._reconnect_logged = False
         self._feed_stale = False
         self._had_frames = True
         self._set_state(ConnectionState.CONNECTED)
@@ -152,7 +149,6 @@ class VisionStream:
         self._source_fps = 0.0
         self._stale_logged = False
         self._feed_stale = False
-        self._reconnect_logged = False
         self._had_frames = False
         with self._lock:
             self._latest = None
@@ -173,7 +169,6 @@ class VisionStream:
         self._last_frame_monotonic = 0.0
         self._source_fps = 0.0
         self._feed_stale = False
-        self._reconnect_logged = False
         had_frames = self._had_frames
         self._had_frames = False
         with self._lock:
@@ -218,117 +213,113 @@ class VisionStream:
 
     def _run_mjpeg(self) -> None:
         # Mirror the known-good capture path used in the standalone ESP32 test app.
-        os.environ.setdefault(
-            "OPENCV_FFMPEG_CAPTURE_OPTIONS",
-            "fflags;nobuffer|flags;low_delay|analyzeduration;0|probesize;32",
-        )
+        os.environ["OPENCV_FFMPEG_CAPTURE_OPTIONS"] = "fflags;nobuffer|flags;low_delay|analyzeduration;0|probesize;32"
         try:
             import cv2  # type: ignore
         except Exception as exc:
-            bus.emit(SystemEvents.LOG_MESSAGE, f"[VisionStream] OpenCV unavailable ({exc}). Falling back to raw HTTP parser.")
-            self._run_mjpeg_raw_http()
-            return
+            bus.emit(SystemEvents.LOG_MESSAGE, f"[VisionStream] OpenCV unavailable ({exc}). Starting in raw HTTP mode.")
+            cv2 = None
 
         self._set_state(ConnectionState.CONNECTING)
-        open_failures = 0
+        transports: list[tuple[str, Callable[[], bool]]] = []
+        if cv2 is not None:
+            transports.append(("ffmpeg", lambda: self._run_mjpeg_ffmpeg_once(cv2)))
+        transports.append(("raw-http", self._run_mjpeg_raw_http_once))
+        if self._snapshot_candidates:
+            transports.append(("snapshot", self._run_snapshot_fallbacks_once))
+
         try:
             while self._running:
-                cap = None
-                try:
-                    cap = cv2.VideoCapture(self._url, cv2.CAP_FFMPEG)
-                    cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
-                    if not cap.isOpened():
-                        raise ConnectionError("cannot open camera stream")
-
-                    open_failures = 0
-                    self._on_transport_open("stream open")
-                    bus.emit(SystemEvents.LOG_MESSAGE, "[VisionStream] MJPEG capture open. Waiting for first frame.")
-
-                    while self._running:
-                        ok, frame = cap.read()
-                        if not ok or frame is None:
-                            raise ConnectionError("camera frame read failed")
-                        self._ingest_frame(frame)
-                except Exception as exc:
-                    if "cannot open camera stream" in str(exc):
-                        open_failures += 1
-                    self._on_error(None, exc)
-                finally:
-                    if cap is not None:
-                        try:
-                            cap.release()
-                        except Exception:
-                            pass
-                    self._on_close(None, None, None)
-
-                if open_failures >= 3:
-                    bus.emit(
-                        SystemEvents.LOG_MESSAGE,
-                        "[VisionStream] OpenCV capture failed repeatedly. Falling back to raw HTTP MJPEG parser.",
-                    )
-                    if self._run_mjpeg_raw_http():
-                        return
-                    if self._run_snapshot_fallbacks():
-                        return
-                    return
-
-                if self._running:
-                    self._set_state(ConnectionState.CONNECTING)
-                    time.sleep(self._config.reconnect_interval)
+                cycle_had_frames = False
+                for name, runner in transports:
+                    if not self._running:
+                        break
+                    if name != "ffmpeg":
+                        bus.emit(SystemEvents.LOG_MESSAGE, f"[VisionStream] Trying {name} camera transport.")
+                    had_frames = runner()
+                    cycle_had_frames = cycle_had_frames or had_frames
+                    if had_frames:
+                        break
+                if not self._running:
+                    break
+                self._set_state(ConnectionState.CONNECTING)
+                time.sleep(0.5 if cycle_had_frames else self._config.reconnect_interval)
         finally:
             self._set_state(ConnectionState.DISCONNECTED)
 
-    def _run_mjpeg_raw_http(self) -> bool:
+    def _run_mjpeg_ffmpeg_once(self, cv2) -> bool:
+        cap = None
+        had_frames = False
+        try:
+            cap = cv2.VideoCapture(self._url, cv2.CAP_FFMPEG)
+            cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+            if not cap.isOpened():
+                raise ConnectionError("cannot open camera stream")
+
+            self._on_transport_open("stream open")
+            bus.emit(SystemEvents.LOG_MESSAGE, "[VisionStream] MJPEG capture open. Waiting for first frame.")
+
+            while self._running:
+                ok, frame = cap.read()
+                if not ok or frame is None:
+                    raise ConnectionError("camera frame read failed")
+                had_frames = True
+                self._ingest_frame(frame)
+        except Exception as exc:
+            self._on_error(None, exc)
+        finally:
+            if cap is not None:
+                try:
+                    cap.release()
+                except Exception:
+                    pass
+            self._on_close(None, None, None)
+        return had_frames
+
+    def _run_mjpeg_raw_http_once(self) -> bool:
         self._set_state(ConnectionState.CONNECTING)
         headers = {
             "Cache-Control": "no-cache",
             "Pragma": "no-cache",
             "Connection": "keep-alive",
+            "User-Agent": "VISION/1.0",
         }
         read_size = 4096
         timeout = max(1.0, self._config.ws_recv_timeout)
         had_frames = False
 
+        stream: Optional[HTTPResponse] = None
         try:
+            req = Request(self._url, headers=headers)
+            stream = urlopen(req, timeout=timeout)
+            with self._lock:
+                self._http_stream = stream
+            self._on_transport_open("stream open")
+            bus.emit(SystemEvents.LOG_MESSAGE, "[VisionStream] MJPEG stream open. Waiting for first frame.")
+
+            buffer = bytearray()
             while self._running:
-                stream: Optional[HTTPResponse] = None
-                try:
-                    req = Request(self._url, headers=headers)
-                    stream = urlopen(req, timeout=timeout)
-                    with self._lock:
-                        self._http_stream = stream
-                    self._on_transport_open("stream open")
-                    bus.emit(SystemEvents.LOG_MESSAGE, "[VisionStream] MJPEG stream open. Waiting for first frame.")
-
-                    buffer = bytearray()
-                    while self._running:
-                        chunk = stream.read(read_size)
-                        if not chunk:
-                            raise ConnectionError("camera stream ended")
-                        self._consume_mjpeg_chunk(chunk, buffer)
-                        had_frames = had_frames or self._had_frames
-                except URLError as exc:
-                    self._on_error(None, exc.reason if getattr(exc, "reason", None) else exc)
-                except Exception as exc:
-                    self._on_error(None, exc)
-                finally:
-                    if stream is not None:
-                        try:
-                            stream.close()
-                        except Exception:
-                            pass
-                    with self._lock:
-                        self._http_stream = None
-                    self._on_close(None, None, None)
-
-                if self._running:
-                    self._set_state(ConnectionState.CONNECTING)
-                    time.sleep(self._config.reconnect_interval)
+                chunk = stream.read(read_size)
+                if not chunk:
+                    raise ConnectionError("camera stream ended")
+                self._consume_mjpeg_chunk(chunk, buffer)
+                had_frames = had_frames or self._had_frames
+        except URLError as exc:
+            self._on_error(None, exc.reason if getattr(exc, "reason", None) else exc)
+        except Exception as exc:
+            self._on_error(None, exc)
         finally:
-            self._set_state(ConnectionState.DISCONNECTED)
+            if stream is not None:
+                try:
+                    stream.close()
+                except Exception:
+                    pass
+            with self._lock:
+                self._http_stream = None
+            self._on_close(None, None, None)
         return had_frames
 
-    def _run_snapshot_fallbacks(self) -> bool:
+    def _run_snapshot_fallbacks_once(self) -> bool:
         for candidate in self._snapshot_candidates:
             if not self._running:
                 return False

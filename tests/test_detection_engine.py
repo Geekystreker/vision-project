@@ -49,3 +49,18 @@ def test_select_primary_prefers_largest_target_label():
     assert primary is not None
     assert primary.label == "person"
     assert primary.area == 196
+
+
+def test_detection_engine_suppresses_nested_duplicate_target_boxes():
+    cfg = RoverConfig("ws://cam", "ws://servo", "ws://motor")
+    detections = [
+        Detection(label="person", confidence=0.82, bbox=BoundingBox(0, 0, 100, 180, confidence=0.82)),
+        Detection(label="person", confidence=0.91, bbox=BoundingBox(28, 24, 34, 46, confidence=0.91)),
+    ]
+    engine = DetectionEngine(cfg, backend=FakeBackend(detections))
+
+    result = engine.detect(np.zeros((8, 8, 3), dtype=np.uint8))
+
+    assert len(result) == 1
+    assert result[0].bbox.w == 100
+    assert result[0].bbox.h == 180

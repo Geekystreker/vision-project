@@ -133,3 +133,38 @@ def test_builds_snapshot_fallback_candidates_for_http_stream():
 
     assert "http://camera:81/cam-hi.jpg" in stream._snapshot_candidates
     assert "http://camera:81/cam-lo.jpg" in stream._snapshot_candidates
+
+
+def test_consume_mjpeg_chunk_extracts_complete_frame():
+    stream = VisionStream("http://localhost:81/stream", RoverConfig("http://localhost:81/stream", "ws://servo", "ws://motor"))
+
+    payload = b"\xff\xd8" + b"abc123" + b"\xff\xd9"
+    chunk = b"noise" + payload + b"tail"
+    stream._consume_mjpeg_chunk(chunk, bytearray())
+
+    latest = stream.get_latest_frame()
+    assert latest == payload
+
+
+def test_mjpeg_transport_falls_back_to_raw_http_after_ffmpeg_failure(monkeypatch):
+    config = RoverConfig("http://localhost:81/stream", "ws://servo", "ws://motor")
+    stream = VisionStream(config.vision_stream_url, config)
+    calls: list[str] = []
+
+    def fake_ffmpeg(_cv2):
+        calls.append("ffmpeg")
+        return False
+
+    def fake_raw_http():
+        calls.append("raw-http")
+        stream._running = False
+        return True
+
+    monkeypatch.setattr(stream, "_run_mjpeg_ffmpeg_once", fake_ffmpeg)
+    monkeypatch.setattr(stream, "_run_mjpeg_raw_http_once", fake_raw_http)
+    monkeypatch.setattr(stream, "_run_snapshot_fallbacks_once", lambda: False)
+
+    stream._running = True
+    stream._run_mjpeg()
+
+    assert calls[:2] == ["ffmpeg", "raw-http"]

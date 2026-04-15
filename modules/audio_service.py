@@ -24,6 +24,7 @@ class ClapDetector:
     threshold: float
     window_seconds: float
     cooldown_seconds: float
+    min_separation_seconds: float = 0.12
     _first_clap_time: float | None = None
     _cooldown_until: float = 0.0
 
@@ -33,6 +34,8 @@ class ClapDetector:
 
         if self._first_clap_time is None or (now - self._first_clap_time) > self.window_seconds:
             self._first_clap_time = now
+            return False
+        if (now - self._first_clap_time) < self.min_separation_seconds:
             return False
 
         self._first_clap_time = None
@@ -57,6 +60,7 @@ class AudioService:
             threshold=config.clap_amplitude_threshold,
             window_seconds=config.clap_window_seconds,
             cooldown_seconds=config.clap_cooldown_seconds,
+            min_separation_seconds=config.clap_min_separation_seconds,
         )
         self._whisper_model = None
         bus.subscribe(SystemEvents.STATE_CHANGE, self._on_state_change)
@@ -65,13 +69,21 @@ class AudioService:
     def set_launch_callback(self, callback: Callable[[], None]) -> None:
         self._launch_callback = callback
 
+    def _log(self, message: str) -> None:
+        print(message, flush=True)
+        bus.emit(SystemEvents.LOG_MESSAGE, message)
+
     def toggle_listening(self, active: bool) -> None:
         self._listening_enabled = bool(active)
         self._ensure_thread()
 
     def set_wake_listener(self, active: bool) -> None:
+        was_enabled = self._wake_enabled
         self._wake_enabled = bool(active)
         self._ensure_thread()
+        if self._wake_enabled != was_enabled:
+            status = "enabled" if self._wake_enabled else "disabled"
+            self._log(f"[AudioService] Clap wake listener {status}.")
 
     def stop(self) -> None:
         self._running = False
@@ -96,9 +108,10 @@ class AudioService:
                 frames_per_buffer=self._config.audio_chunk_size,
             )
         except Exception as exc:
-            bus.emit(SystemEvents.LOG_MESSAGE, f"[AudioService] Microphone unavailable: {exc}")
+            self._log(f"[AudioService] Microphone unavailable; clap listener cannot start: {exc}")
             self._running = False
             return
+        self._log("[AudioService] Microphone stream active. Listening for double clap.")
 
         speech_frames: list[bytes] = []
         speech_active = False
@@ -113,7 +126,7 @@ class AudioService:
                 try:
                     chunk = stream.read(self._config.audio_chunk_size, exception_on_overflow=False)
                 except Exception as exc:
-                    bus.emit(SystemEvents.LOG_MESSAGE, f"[AudioService] Stream read error: {exc}")
+                    self._log(f"[AudioService] Stream read error: {exc}")
                     time.sleep(0.2)
                     continue
 
@@ -121,13 +134,14 @@ class AudioService:
                 amplitude = self._normalized_peak(chunk)
 
                 if self._wake_enabled and self._clap_detector.register_peak(amplitude, now):
+                    self._log("[AudioService] Double clap detected.")
                     bus.emit(SystemEvents.AUDIO_WAKE_TRIGGERED, "DOUBLE_CLAP")
                     bus.emit(SystemEvents.APP_LAUNCH_REQUESTED, "DOUBLE_CLAP")
                     if self._launch_callback:
                         try:
                             self._launch_callback()
                         except Exception as exc:
-                            bus.emit(SystemEvents.LOG_MESSAGE, f"[AudioService] Launch callback failed: {exc}")
+                            self._log(f"[AudioService] Launch callback failed: {exc}")
 
                 if not self._listening_enabled or self._in_tts_cooldown():
                     speech_frames.clear()

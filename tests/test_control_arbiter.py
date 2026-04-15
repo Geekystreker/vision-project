@@ -20,3 +20,13 @@ def test_emergency_stop_blocks_voice_and_autonomy():
     assert arbiter.emergency_stop_active is True
     assert arbiter.allow_voice() is False
     assert arbiter.allow_autonomy() is False
+
+
+def test_autonomous_mode_allows_autonomy_when_active():
+    arbiter = ControlArbiter()
+
+    arbiter.set_autonomous_mode()
+
+    assert arbiter.current_mode() == ControlMode.AUTONOMOUS
+    assert arbiter.autonomous_enabled() is True
+    assert arbiter.allow_autonomy() is True

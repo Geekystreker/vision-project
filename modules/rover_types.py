@@ -14,6 +14,7 @@ class RoverMode(Enum):
 class ControlMode(Enum):
     IDLE = "IDLE"
     MANUAL = "MANUAL"
+    AUTONOMOUS = "AUTONOMOUS"
     FOLLOW_PERSON = "FOLLOW_PERSON"
     VOICE_NAV = "VOICE_NAV"
     INSPECT_SCENE = "INSPECT_SCENE"
@@ -65,6 +66,7 @@ class Detection:
 class TrackedTarget:
     target_id: int
     detection: Detection
+    source_track_id: int | None = None
     stable_frames: int = 1
     lost_frames: int = 0
     last_seen: float = field(default_factory=time.monotonic)
@@ -93,6 +95,15 @@ class VisionSnapshot:
     mode: ControlMode = ControlMode.IDLE
     fps: float = 0.0
     source_fps: float = 0.0
+    inference_ms: float = 0.0
     last_command: str = "S"
+    servo_pan: int = 90
+    servo_tilt: int = 90
+    target_coords: tuple[int, int] | None = None
+    predicted_target_coords: tuple[int, int] | None = None
+    predicted_target_path: tuple[tuple[int, int], ...] = field(default_factory=tuple)
+    network_latency_ms: float = 0.0
+    target_locked: bool = False
+    locked_target_id: int | None = None
     links: dict[str, ConnectionState] = field(default_factory=dict)
     timestamp: float = field(default_factory=time.time)

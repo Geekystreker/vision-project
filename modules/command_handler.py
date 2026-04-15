@@ -16,7 +16,7 @@ class CommandResolution:
 
 class CommandHandler:
     VALID_MOVEMENT_COMMANDS = {"F", "B", "L", "R", "S"}
-    VALID_META_COMMANDS = {"FOLLOW", "MANUAL", "INSPECT", "E_STOP"}
+    VALID_META_COMMANDS = {"FOLLOW", "AUTO", "MANUAL", "INSPECT", "E_STOP"}
 
     SPEECH_MAP = {
         "F": "Moving forward.",
@@ -25,6 +25,7 @@ class CommandHandler:
         "R": "Turning right.",
         "S": "Stopping now.",
         "FOLLOW": "Follow mode is active. I will track the person ahead.",
+        "AUTO": "Autonomous mode is active. I will drive from live scene awareness.",
         "MANUAL": "Switching back to manual control.",
         "INSPECT": "Scanning the scene in front of me.",
         "E_STOP": "Emergency stop engaged.",
@@ -41,8 +42,13 @@ class CommandHandler:
         "halt": "S",
         "follow the person ahead of you": "FOLLOW",
         "follow person": "FOLLOW",
+        "autonomous mode": "AUTO",
+        "drive autonomously": "AUTO",
+        "drive yourself": "AUTO",
+        "start patrol": "AUTO",
         "manual mode": "MANUAL",
         "stop following": "MANUAL",
+        "stop autonomous mode": "MANUAL",
         "what's in front of you": "INSPECT",
         "what is in front of you": "INSPECT",
         "emergency stop": "E_STOP",
@@ -72,6 +78,8 @@ class CommandHandler:
 
         if "follow" in text and "person" in text:
             return "FOLLOW"
+        if "autonomous" in text or "autopilot" in text or "drive yourself" in text or "patrol" in text:
+            return "AUTO"
         if "manual" in text or "stop following" in text:
             return "MANUAL"
         if "front" in text and ("what" in text or "scan" in text):

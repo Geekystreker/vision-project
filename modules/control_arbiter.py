@@ -36,6 +36,9 @@ class ControlArbiter:
     def follow_enabled(self) -> bool:
         return self._base_mode == ControlMode.FOLLOW_PERSON and not self._emergency_stop
 
+    def autonomous_enabled(self) -> bool:
+        return self._base_mode == ControlMode.AUTONOMOUS and not self._emergency_stop
+
     def set_manual_mode(self) -> ControlMode:
         return self._set_mode(ControlMode.MANUAL, sticky=True)
 
@@ -46,10 +49,19 @@ class ControlArbiter:
         self._emergency_stop = False
         return self._set_mode(ControlMode.FOLLOW_PERSON, sticky=True)
 
+    def set_autonomous_mode(self) -> ControlMode:
+        self._emergency_stop = False
+        return self._set_mode(ControlMode.AUTONOMOUS, sticky=True)
+
     def toggle_follow_mode(self) -> ControlMode:
         if self._base_mode == ControlMode.FOLLOW_PERSON:
             return self.set_manual_mode()
         return self.set_follow_mode()
+
+    def toggle_autonomous_mode(self) -> ControlMode:
+        if self._base_mode == ControlMode.AUTONOMOUS:
+            return self.set_manual_mode()
+        return self.set_autonomous_mode()
 
     def begin_keyboard_override(self) -> ControlMode:
         self._emergency_stop = False
@@ -90,7 +102,7 @@ class ControlArbiter:
         now = time.monotonic()
         if now < self._keyboard_override_until or now < self._voice_override_until:
             return False
-        return self._base_mode == ControlMode.FOLLOW_PERSON and self._current_mode == ControlMode.FOLLOW_PERSON
+        return self._base_mode in {ControlMode.FOLLOW_PERSON, ControlMode.AUTONOMOUS} and self._current_mode == self._base_mode
 
     def _set_mode(self, mode: ControlMode, *, sticky: bool) -> ControlMode:
         if sticky:

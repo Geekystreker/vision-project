@@ -179,6 +179,43 @@ def test_update_servos_smooths_target_measurements_before_tracking():
     assert 60 < smoothed[0] < 180
 
 
+def test_update_servos_resets_filter_when_logical_target_changes():
+    cfg = RoverConfig(
+        "ws://cam",
+        "ws://servo",
+        "ws://motor",
+        tracking_deadband_px=1,
+        tracking_measurement_alpha=0.20,
+    )
+    rover = DummyRover()
+    servo = DummyTransport()
+    motor = DummyTransport()
+    controller = TrackingController(cfg, rover, servo, motor)
+    first = make_target(40, 60, x=180, y=100)
+    second = make_target(40, 60, x=40, y=100)
+    second.target_id = 2
+
+    controller.update_servos(first, 240, 200)
+    controller.update_servos(second, 240, 200)
+
+    assert controller._state.active_target_id == 2
+    assert controller._state.smoothed_target_point == (60.0, 130.0)
+
+
+def test_follow_drive_waits_until_target_is_stable():
+    cfg = RoverConfig("ws://cam", "ws://servo", "ws://motor", target_lock_frames=3)
+    rover = DummyRover()
+    servo = DummyTransport()
+    motor = DummyTransport()
+    controller = TrackingController(cfg, rover, servo, motor)
+
+    result = controller.update(make_target(10, 10, x=0, y=0, stable_frames=1), 200, 200)
+
+    assert result == "S"
+    assert rover.commands[-1] == "S"
+    assert motor.commands[-1] == "S"
+
+
 def test_no_detection_timeout_stops_rover():
     cfg = RoverConfig("ws://cam", "ws://servo", "ws://motor", no_detection_timeout=0.01)
     rover = DummyRover()

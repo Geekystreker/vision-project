@@ -244,6 +244,7 @@ class RoverVisionApp:
             self._publish_snapshot(None, [], None, mode)
             return
 
+        frame = self._orient_frame(frame)
         self._camera_missing_notice_emitted = False
 
         with self._frame_handoff_lock:
@@ -426,6 +427,12 @@ class RoverVisionApp:
             return frame
         except Exception:
             return self._last_good_frame
+
+    def _orient_frame(self, frame: np.ndarray) -> np.ndarray:
+        flip_code = self._config.camera_flip_code
+        if flip_code is None:
+            return frame
+        return cv2.flip(frame, int(flip_code))
 
     def _ensure_detection_loaded(self) -> None:
         if self._detection_loaded:

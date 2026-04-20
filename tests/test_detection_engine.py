@@ -64,3 +64,13 @@ def test_detection_engine_suppresses_nested_duplicate_target_boxes():
     assert len(result) == 1
     assert result[0].bbox.w == 100
     assert result[0].bbox.h == 180
+
+
+def test_detection_engine_ignores_empty_frame_source():
+    cfg = RoverConfig("ws://cam", "ws://servo", "ws://motor")
+    backend = FakeBackend([make_detection("person", 12)])
+    engine = DetectionEngine(cfg, backend=backend)
+
+    result = engine.detect(np.array([], dtype=np.uint8))
+
+    assert result == []

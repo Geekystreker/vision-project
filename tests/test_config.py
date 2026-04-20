@@ -15,9 +15,12 @@ def test_required_fields_exist():
     assert cfg.detector_backend == "yolo26"
     assert cfg.target_label == "person"
     assert cfg.detector_half_precision is True
-    assert cfg.detector_max_detections == 6
+    assert cfg.detector_max_detections == 4
     assert cfg.detector_confidence == 0.30
+    assert cfg.detector_track_classes == (0,)
+    assert cfg.camera_flip_code == -1
     assert cfg.servo_send_hz > 0
+    assert cfg.servo_motion_smoothing_alpha > 0
     assert cfg.servo_center_angle == 90
     assert cfg.servo_min_angle == 10
     assert cfg.servo_max_angle == 170
@@ -40,6 +43,8 @@ def test_required_fields_exist():
     assert cfg.kalman_process_noise > 0
     assert cfg.kalman_measurement_noise > 0
     assert cfg.detector_tracking_iou > 0
+    assert cfg.target_acquisition_frames >= 1
+    assert cfg.target_rebind_frames >= 1
     assert cfg.resolved_tracker_config_path.name == "rover_botsort.yaml"
     assert cfg.audio_sample_rate > 0
     assert cfg.key_repeat_hz > 0
@@ -65,7 +70,7 @@ def test_build_rover_config_uses_separate_default_camera_ip():
     cfg = build_rover_config("rtx5060")
 
     assert cfg.vision_stream_url == "http://192.168.137.100:81/stream"
-    assert cfg.servo_url == "ws://198.168.137.101:80/Jarvis"
+    assert cfg.servo_url == "ws://192.168.137.101:80/Jarvis"
 
 
 def test_legacy_yolo_properties_map_to_detector_fields():
@@ -111,8 +116,10 @@ def test_build_rover_config_uses_rtx5060_profile_defaults():
     assert cfg.snapshot_poll_hz == 30
     assert cfg.detector_input_width == 960
     assert cfg.detector_device == "cuda:0"
-    assert cfg.detector_confidence == 0.30
-    assert cfg.servo_send_hz == 30
+    assert cfg.detector_confidence == 0.32
+    assert cfg.detector_tracking_confidence == 0.36
+    assert cfg.servo_send_hz == 26
+    assert cfg.target_acquisition_frames == 3
 
 
 def test_build_rover_config_falls_back_to_mx330_for_unknown_profile():

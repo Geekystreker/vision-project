@@ -48,7 +48,7 @@ def test_tracker_ignores_other_ids_while_locked():
 
 
 def test_tracker_rebinds_new_raw_id_to_same_logical_target():
-    cfg = RoverConfig("ws://cam", "ws://servo", "ws://motor", track_iou_threshold=0.10)
+    cfg = RoverConfig("ws://cam", "ws://servo", "ws://motor", track_iou_threshold=0.10, target_rebind_frames=1)
     tracker = TargetTracker(cfg)
 
     first = tracker.update([make_detection(4, 80, 80, 40, 40)], 200, 200)
@@ -61,7 +61,7 @@ def test_tracker_rebinds_new_raw_id_to_same_logical_target():
 
 
 def test_tracker_falls_back_to_box_rebind_when_track_ids_are_missing():
-    cfg = RoverConfig("ws://cam", "ws://servo", "ws://motor", track_iou_threshold=0.10)
+    cfg = RoverConfig("ws://cam", "ws://servo", "ws://motor", track_iou_threshold=0.10, target_rebind_frames=1)
     tracker = TargetTracker(cfg)
 
     first = tracker.update([make_detection(None, 80, 80, 40, 40)], 200, 200)
@@ -91,13 +91,65 @@ def test_tracker_reacquires_new_person_after_old_target_leaves():
     first = tracker.update([make_detection(4, 80, 80, 40, 40)], 200, 200)
 
     second = None
-    for _ in range(3):
+    for _ in range(7):
         second = tracker.update([make_detection(11, 150, 75, 42, 42)], 200, 200)
 
     assert first is not None
     assert second is not None
     assert second.target_id != first.target_id
     assert second.source_track_id == 11
+
+
+def test_tracker_does_not_snap_to_different_person_while_lock_is_alive():
+    cfg = RoverConfig("ws://cam", "ws://servo", "ws://motor", max_target_lost_frames=6)
+    tracker = TargetTracker(cfg)
+    first = tracker.update([make_detection(4, 80, 80, 40, 40)], 200, 200)
+
+    second = tracker.update([make_detection(11, 150, 75, 42, 42)], 200, 200)
+
+    assert first is not None
+    assert second is None
+    assert tracker.locked_target_id() == first.target_id
+
+
+def test_tracker_requires_stable_acquisition_when_configured():
+    cfg = RoverConfig("ws://cam", "ws://servo", "ws://motor", target_acquisition_frames=3)
+    tracker = TargetTracker(cfg)
+
+    first = tracker.update([make_detection(4, 80, 80, 40, 40)], 200, 200)
+    second = tracker.update([make_detection(4, 82, 80, 40, 40)], 200, 200)
+    third = tracker.update([make_detection(4, 84, 80, 40, 40)], 200, 200)
+
+    assert first is None
+    assert second is None
+    assert third is not None
+    assert third.source_track_id == 4
+
+
+def test_tracker_can_acquire_same_person_despite_raw_id_churn():
+    cfg = RoverConfig("ws://cam", "ws://servo", "ws://motor", target_acquisition_frames=3)
+    tracker = TargetTracker(cfg)
+
+    first = tracker.update([make_detection(10, 80, 80, 40, 40)], 200, 200)
+    second = tracker.update([make_detection(11, 82, 80, 40, 40)], 200, 200)
+    third = tracker.update([make_detection(12, 84, 80, 40, 40)], 200, 200)
+
+    assert first is None
+    assert second is None
+    assert third is not None
+    assert third.source_track_id == 12
+
+
+def test_tracker_rejects_same_track_id_when_box_jumps_to_face_crop():
+    cfg = RoverConfig("ws://cam", "ws://servo", "ws://motor", max_target_lost_frames=6)
+    tracker = TargetTracker(cfg)
+    first = tracker.update([make_detection(4, 40, 10, 110, 180)], 200, 200)
+
+    second = tracker.update([make_detection(4, 70, 36, 24, 32)], 200, 200)
+
+    assert first is not None
+    assert second is None
+    assert tracker.locked_target_id() == first.target_id
 
 
 def test_tracker_clears_after_long_target_loss():
@@ -113,7 +165,7 @@ def test_tracker_clears_after_long_target_loss():
     assert tracker.locked_target_id() is None
 
 
-def test_tracker_smooths_visual_box_when_same_target_suddenly_shrinks():
+def test_tracker_holds_lock_instead_of_accepting_sudden_face_crop():
     cfg = RoverConfig("ws://cam", "ws://servo", "ws://motor", target_box_smoothing_alpha=0.22)
     tracker = TargetTracker(cfg)
 
@@ -121,7 +173,5 @@ def test_tracker_smooths_visual_box_when_same_target_suddenly_shrinks():
     second = tracker.update([make_detection(4, 68, 36, 34, 52)], 200, 200)
 
     assert first is not None
-    assert second is not None
-    assert second.target_id == first.target_id
-    assert second.bbox.h > 52
-    assert second.bbox.w > 34
+    assert second is None
+    assert tracker.locked_target_id() == first.target_id

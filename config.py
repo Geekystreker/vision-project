@@ -21,7 +21,7 @@ DEFAULT_KNOWLEDGE_PATHS = (
     "modules",
 )
 DEFAULT_TRACKER_CONFIG = "trackers/rover_botsort.yaml"
-DEFAULT_ESP32_IP = os.getenv("ROVER_ESP32_IP", "198.168.137.101")
+DEFAULT_ESP32_IP = os.getenv("ROVER_ESP32_IP", "192.168.137.101")
 DEFAULT_CAMERA_IP = os.getenv("ROVER_CAMERA_IP", "192.168.137.100")
 DEFAULT_CAMERA_STREAM_URL = os.getenv("ROVER_CAMERA_STREAM_URL", f"http://{DEFAULT_CAMERA_IP}:81/stream")
 DEFAULT_JARVIS_WS_URL = f"ws://{DEFAULT_ESP32_IP}:80/Jarvis"
@@ -60,6 +60,7 @@ class RoverConfig:
     camera_disconnect_timeout: float = 1.0
     camera_initial_frame_timeout: float = 8.0
     camera_reconnect_timeout: float = 12.0
+    camera_flip_code: int | None = -1
 
     # Manual pan / tilt
     servo_step: float = 1.0
@@ -73,9 +74,10 @@ class RoverConfig:
     servo_manual_pan_direction: int = -1
     servo_manual_tilt_direction: int = -1
     servo_send_hz: int = 24
-    servo_max_step_deg: float = 4.0
-    servo_max_speed_deg_per_sec: float = 95.0
-    servo_min_delta_deg: float = 0.75
+    servo_max_step_deg: float = 3.0
+    servo_max_speed_deg_per_sec: float = 72.0
+    servo_min_delta_deg: float = 1.15
+    servo_motion_smoothing_alpha: float = 0.34
     motor_drive_speed: int = 170
     motor_turn_speed: int = 150
     motor_send_hz: int = 20
@@ -87,22 +89,24 @@ class RoverConfig:
     bbox_min_fraction: float = 0.10
     bbox_max_fraction: float = 0.30
     no_detection_timeout: float = 2.0
-    max_target_lost_frames: int = 10
-    track_iou_threshold: float = 0.20
+    max_target_lost_frames: int = 30
+    track_iou_threshold: float = 0.24
     duplicate_detection_iou_threshold: float = 0.72
+    target_acquisition_frames: int = 1
+    target_rebind_frames: int = 2
     target_lock_frames: int = 3
-    target_box_smoothing_alpha: float = 0.22
+    target_box_smoothing_alpha: float = 0.18
     follow_pan_align_threshold_deg: float = 12.0
     scene_announce_cooldown_seconds: float = 6.0
     pid_integral_limit: float = 1.6
-    pan_pid_kp: float = 20.0
-    pan_pid_ki: float = 3.0
-    pan_pid_kd: float = 7.5
-    tilt_pid_kp: float = 18.0
-    tilt_pid_ki: float = 2.4
-    tilt_pid_kd: float = 6.0
-    tracking_deadband_px: int = 10
-    tracking_measurement_alpha: float = 0.35
+    pan_pid_kp: float = 13.0
+    pan_pid_ki: float = 0.55
+    pan_pid_kd: float = 2.8
+    tilt_pid_kp: float = 11.0
+    tilt_pid_ki: float = 0.45
+    tilt_pid_kd: float = 2.3
+    tracking_deadband_px: int = 16
+    tracking_measurement_alpha: float = 0.24
     kalman_max_prediction_frames: int = 30
     kalman_process_noise: float = 35.0
     kalman_measurement_noise: float = 90.0
@@ -128,9 +132,9 @@ class RoverConfig:
     detector_tracking_iou: float = 0.55
     detector_device: str = "auto"
     detector_half_precision: bool = True
-    detector_max_detections: int = 6
+    detector_max_detections: int = 4
     detector_input_width: int = 416
-    detector_track_classes: tuple[int, ...] | None = None
+    detector_track_classes: tuple[int, ...] | None = (0,)
     detector_tracker_config: str = DEFAULT_TRACKER_CONFIG
     target_label: str = "person"
 
@@ -206,21 +210,28 @@ PERFORMANCE_PROFILES: dict[str, dict[str, int | float | str]] = {
         "snapshot_poll_hz": 30,
         "detector_input_width": 960,
         "detector_device": "cuda:0",
-        "detector_confidence": 0.30,
+        "detector_confidence": 0.32,
+        "detector_tracking_confidence": 0.36,
         "detector_tracking_iou": 0.60,
-        "servo_send_hz": 30,
-        "servo_max_step_deg": 4.6,
-        "servo_max_speed_deg_per_sec": 105.0,
-        "pan_pid_kp": 22.0,
-        "pan_pid_ki": 2.2,
-        "pan_pid_kd": 9.5,
-        "tilt_pid_kp": 18.0,
-        "tilt_pid_ki": 1.8,
-        "tilt_pid_kd": 8.4,
-        "tracking_deadband_px": 10,
+        "servo_send_hz": 26,
+        "servo_max_step_deg": 2.8,
+        "servo_max_speed_deg_per_sec": 68.0,
+        "servo_min_delta_deg": 1.2,
+        "servo_motion_smoothing_alpha": 0.30,
+        "target_acquisition_frames": 3,
+        "target_rebind_frames": 3,
+        "target_box_smoothing_alpha": 0.16,
+        "pan_pid_kp": 12.0,
+        "pan_pid_ki": 0.45,
+        "pan_pid_kd": 2.6,
+        "tilt_pid_kp": 10.0,
+        "tilt_pid_ki": 0.35,
+        "tilt_pid_kd": 2.1,
+        "tracking_deadband_px": 18,
+        "tracking_measurement_alpha": 0.18,
         "kalman_max_prediction_frames": 30,
-        "kalman_process_noise": 30.0,
-        "kalman_measurement_noise": 75.0,
+        "kalman_process_noise": 18.0,
+        "kalman_measurement_noise": 130.0,
     },
 }
 

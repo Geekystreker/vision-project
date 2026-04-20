@@ -19,7 +19,12 @@ class TargetTracker:
         self._logical_target_serial = 0
         self._lost_frames = 0
         self._max_lost_frames = max(2, config.max_target_lost_frames)
-        self._candidate_reacquire_frames = max(2, min(self._max_lost_frames, config.target_lock_frames))
+        self._acquisition_frames_required = max(1, int(getattr(config, "target_acquisition_frames", 1)))
+        self._rebind_frames_required = max(1, int(getattr(config, "target_rebind_frames", 2)))
+        self._pending_candidate: Detection | None = None
+        self._pending_candidate_frames = 0
+        self._pending_rebind: Detection | None = None
+        self._pending_rebind_frames = 0
 
     def update(self, detections: list[Detection], frame_w: int, frame_h: int) -> TrackedTarget | None:
         candidates = [
@@ -36,16 +41,26 @@ class TargetTracker:
             selected = self._acquire_target(candidates, frame_w, frame_h)
             if selected is None:
                 return self._handle_target_missing()
-            return self._lock_target(selected, stable_frames=1)
+            confirmed = self._confirm_candidate(selected, self._acquisition_frames_required)
+            if confirmed is None:
+                self._current = None
+                return None
+            self._reset_pending_candidate()
+            return self._lock_target(confirmed, stable_frames=self._acquisition_frames_required)
 
         selected = None
         if self._locked_track_id is not None:
-            selected = next((item for item in candidates if item.track_id == self._locked_track_id), None)
+            same_track = next((item for item in candidates if item.track_id == self._locked_track_id), None)
+            if same_track is not None and self._is_valid_locked_update(same_track):
+                selected = same_track
         if selected is None:
-            selected = self._rebind_target(candidates, frame_w, frame_h)
+            rebind = self._rebind_target(candidates, frame_w, frame_h)
+            if rebind is not None:
+                selected = self._confirm_rebind(rebind)
         if selected is None:
             return self._handle_target_missing(candidates, frame_w, frame_h)
 
+        self._reset_pending_rebind()
         previous_stable_frames = self._current.stable_frames if self._current is not None else 0
         return self._lock_target(selected, stable_frames=previous_stable_frames + 1, reuse_logical_id=True)
 
@@ -54,6 +69,8 @@ class TargetTracker:
         self._locked_target_id = None
         self._locked_track_id = None
         self._lost_frames = 0
+        self._reset_pending_candidate()
+        self._reset_pending_rebind()
         bus.emit(SystemEvents.TRACK_TARGET_CHANGED, None)
 
     def current_target(self) -> TrackedTarget | None:
@@ -83,15 +100,15 @@ class TargetTracker:
                 last_seen=self._current.last_seen,
                 source_track_id=self._current.source_track_id,
             )
-        if candidates and frame_w is not None and frame_h is not None and self._lost_frames >= self._candidate_reacquire_frames:
-            selected = self._acquire_target(candidates, frame_w, frame_h)
-            self._current = None
-            self._locked_target_id = None
-            self._locked_track_id = None
-            if selected is not None:
-                return self._lock_target(selected, stable_frames=1)
         if self._lost_frames > self._max_lost_frames:
             self.clear()
+            if candidates and frame_w is not None and frame_h is not None:
+                selected = self._acquire_target(candidates, frame_w, frame_h)
+                if selected is not None:
+                    confirmed = self._confirm_candidate(selected, self._acquisition_frames_required)
+                    if confirmed is not None:
+                        self._reset_pending_candidate()
+                        return self._lock_target(confirmed, stable_frames=self._acquisition_frames_required)
             return None
         bus.emit(SystemEvents.TRACK_TARGET_CHANGED, None)
         return None
@@ -150,6 +167,51 @@ class TargetTracker:
             track_id=current.track_id,
         )
 
+    def _confirm_candidate(self, detection: Detection, required_frames: int) -> Detection | None:
+        required_frames = max(1, int(required_frames))
+        if self._pending_candidate is None or not self._detections_match_for_confirmation(
+            self._pending_candidate,
+            detection,
+        ):
+            self._pending_candidate = detection
+            self._pending_candidate_frames = 1
+        else:
+            self._pending_candidate = self._stabilize_detection(self._pending_candidate, detection)
+            self._pending_candidate_frames += 1
+        if self._pending_candidate_frames >= required_frames:
+            return self._pending_candidate
+        return None
+
+    def _confirm_rebind(self, detection: Detection) -> Detection | None:
+        if self._pending_rebind is None or not self._detections_match_for_confirmation(
+            self._pending_rebind,
+            detection,
+        ):
+            self._pending_rebind = detection
+            self._pending_rebind_frames = 1
+        else:
+            self._pending_rebind = self._stabilize_detection(self._pending_rebind, detection)
+            self._pending_rebind_frames += 1
+        if self._pending_rebind_frames >= self._rebind_frames_required:
+            return self._pending_rebind
+        return None
+
+    def _is_valid_locked_update(self, detection: Detection) -> bool:
+        if self._current is None:
+            return True
+
+        previous = self._current.bbox
+        current = detection.bbox
+        area_ratio = current.area / max(1.0, float(previous.area))
+        if area_ratio < 0.28 or area_ratio > 3.20:
+            return False
+
+        prev_diag = max(1.0, math.hypot(previous.w, previous.h))
+        center_distance = math.hypot(current.center_x - previous.center_x, current.center_y - previous.center_y)
+        if self._iou(previous, current) >= 0.03:
+            return True
+        return center_distance <= (prev_diag * 0.62)
+
     def _rebind_target(self, candidates: list[Detection], frame_w: int, frame_h: int) -> Detection | None:
         if self._current is None:
             return None
@@ -166,16 +228,44 @@ class TargetTracker:
             center_score = center_distance_sq / frame_diag_sq
             area_ratio = detection.area / max(1.0, float(previous_box.area))
 
-            if iou < self._config.track_iou_threshold and center_score > 0.035:
+            if iou < self._config.track_iou_threshold and center_score > 0.012:
                 continue
-            if area_ratio < 0.35 or area_ratio > 2.85:
+            if area_ratio < 0.48 or area_ratio > 2.05:
                 continue
 
-            score = center_score - (iou * 0.5)
+            score = center_score - (iou * 0.75)
             if best is None or score < best[0]:
                 best = (score, detection)
 
         return best[1] if best is not None else None
+
+    def _detections_match_for_confirmation(self, previous: Detection, current: Detection) -> bool:
+        if previous.track_id is not None and current.track_id is not None:
+            if previous.track_id == current.track_id:
+                return True
+
+        area_ratio = current.area / max(1.0, float(previous.area))
+        if area_ratio < 0.45 or area_ratio > 2.20:
+            return False
+
+        iou = self._iou(previous.bbox, current.bbox)
+        if iou >= 0.10:
+            return True
+
+        prev_diag = max(1.0, math.hypot(previous.bbox.w, previous.bbox.h))
+        center_distance = math.hypot(
+            current.bbox.center_x - previous.bbox.center_x,
+            current.bbox.center_y - previous.bbox.center_y,
+        )
+        return center_distance <= (prev_diag * 0.40)
+
+    def _reset_pending_candidate(self) -> None:
+        self._pending_candidate = None
+        self._pending_candidate_frames = 0
+
+    def _reset_pending_rebind(self) -> None:
+        self._pending_rebind = None
+        self._pending_rebind_frames = 0
 
     @staticmethod
     def _iou(left: BoundingBox, right: BoundingBox) -> float:

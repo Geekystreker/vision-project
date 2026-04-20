@@ -5,7 +5,6 @@ from pathlib import Path
 from typing import Iterable
 
 import numpy as np
-from ultralytics import YOLO
 
 from config import RoverConfig
 from core.event_bus import SystemEvents, bus
@@ -71,6 +70,8 @@ class YOLO26Backend(DetectionBackend):
             if not name:
                 continue
             try:
+                from ultralytics import YOLO
+
                 model = YOLO(name)
                 try:
                     model.to(self._device)
@@ -97,6 +98,12 @@ class YOLO26Backend(DetectionBackend):
 
     def detect(self, frame: np.ndarray) -> list[Detection]:
         if self._model is None:
+            return []
+        if not isinstance(frame, np.ndarray) or frame.size == 0:
+            bus.emit(SystemEvents.LOG_MESSAGE, "[DetectionEngine] Skipping inference because the frame source is empty.")
+            return []
+        if frame.ndim < 2:
+            bus.emit(SystemEvents.LOG_MESSAGE, "[DetectionEngine] Skipping inference because the frame source is malformed.")
             return []
 
         try:
@@ -194,6 +201,8 @@ class DetectionEngine:
         return self._backend.ready()
 
     def detect(self, frame: np.ndarray) -> list[Detection]:
+        if not isinstance(frame, np.ndarray) or frame.size == 0:
+            return []
         detections = self._backend.detect(frame)
         return self._deduplicate_detections(detections)
 

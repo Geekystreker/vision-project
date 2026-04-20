@@ -265,6 +265,26 @@ def test_scale_detection_maps_bbox_back_to_full_frame():
     assert scaled.track_id == 7
 
 
+def test_orient_frame_flips_inverted_camera_frame():
+    cfg = RoverConfig("ws://cam", "ws://servo", "ws://motor", camera_flip_code=-1)
+    app = RoverVisionApp(cfg)
+    frame = np.arange(27, dtype=np.uint8).reshape((3, 3, 3))
+
+    oriented = app._orient_frame(frame)
+
+    assert np.array_equal(oriented, frame[::-1, ::-1])
+
+
+def test_orient_frame_can_be_disabled():
+    cfg = RoverConfig("ws://cam", "ws://servo", "ws://motor", camera_flip_code=None)
+    app = RoverVisionApp(cfg)
+    frame = np.arange(27, dtype=np.uint8).reshape((3, 3, 3))
+
+    oriented = app._orient_frame(frame)
+
+    assert oriented is frame
+
+
 def test_publish_snapshot_carries_tracking_telemetry():
     app = RoverVisionApp(RoverConfig("ws://cam", "ws://servo", "ws://motor"))
     app._tracking_controller._state.pan_angle = 111

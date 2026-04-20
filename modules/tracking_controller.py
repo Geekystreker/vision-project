@@ -27,6 +27,9 @@ class TrackingState:
     predicted_point: tuple[int, int] | None = None
     smoothed_target_point: tuple[float, float] | None = None
     last_tracking_status: str = "IDLE"
+    active_target_id: int | None = None
+    last_pan_delta: float = 0.0
+    last_tilt_delta: float = 0.0
 
 
 class TrackingController:
@@ -91,10 +94,16 @@ class TrackingController:
                 return "PREDICT"
             self._state.target_locked = False
             self._state.predicted_point = None
+            self._state.active_target_id = None
+            self._state.last_pan_delta = 0.0
+            self._state.last_tilt_delta = 0.0
             self._pan_pid.reset()
             self._tilt_pid.reset()
             self._state.last_tracking_status = "IDLE"
             return "IDLE"
+
+        if self._state.active_target_id != target.target_id:
+            self._start_target_session(target.target_id)
 
         self._state.last_detection_time = now
         measured_x, measured_y = self._smooth_measurement(target.bbox.center_x, target.bbox.center_y)
@@ -148,6 +157,9 @@ class TrackingController:
         self._state.predicted_point = None
         self._state.smoothed_target_point = None
         self._state.last_tracking_status = "IDLE"
+        self._state.active_target_id = None
+        self._state.last_pan_delta = 0.0
+        self._state.last_tilt_delta = 0.0
 
     def current_angles(self) -> tuple[int, int]:
         return int(round(self._state.pan_angle)), int(round(self._state.tilt_angle))
@@ -236,11 +248,41 @@ class TrackingController:
             pan_delta = 0.0
         if abs(tilt_delta) < min_delta:
             tilt_delta = 0.0
+        pan_delta = self._smooth_axis_delta(pan_delta, self._state.last_pan_delta)
+        tilt_delta = self._smooth_axis_delta(tilt_delta, self._state.last_tilt_delta)
+        if abs(pan_delta) < min_delta:
+            pan_delta = 0.0
+        if abs(tilt_delta) < min_delta:
+            tilt_delta = 0.0
+        self._state.last_pan_delta = pan_delta
+        self._state.last_tilt_delta = tilt_delta
         if pan_delta == 0.0 and tilt_delta == 0.0:
             return
         self._state.pan_angle = self._clamp_pan_angle(self._state.pan_angle + pan_delta)
         self._state.tilt_angle = self._clamp_tilt_angle(self._state.tilt_angle + tilt_delta)
         self._dispatch_servo(int(round(self._state.pan_angle)), int(round(self._state.tilt_angle)))
+
+    def _start_target_session(self, target_id: int) -> None:
+        self._pan_pid.reset()
+        self._tilt_pid.reset()
+        self._kalman.reset()
+        self._state.prediction_frames = 0
+        self._state.predicted_point = None
+        self._state.smoothed_target_point = None
+        self._state.target_locked = False
+        self._state.active_target_id = target_id
+        self._state.last_pan_delta = 0.0
+        self._state.last_tilt_delta = 0.0
+
+    def _smooth_axis_delta(self, delta: float, previous_delta: float) -> float:
+        if delta == 0.0:
+            return 0.0
+        alpha = max(0.05, min(1.0, float(getattr(self._config, "servo_motion_smoothing_alpha", 1.0))))
+        if previous_delta and ((delta > 0) != (previous_delta > 0)):
+            previous_delta = 0.0
+        if previous_delta == 0.0:
+            return delta
+        return (alpha * delta) + ((1.0 - alpha) * previous_delta)
 
     def _smooth_measurement(self, x: float, y: float) -> tuple[float, float]:
         alpha = max(0.0, min(1.0, float(self._config.tracking_measurement_alpha)))
@@ -304,6 +346,8 @@ class TrackingController:
         )
 
     def _drive_command(self, target: TrackedTarget, frame_w: int, frame_h: int) -> str:
+        if target.stable_frames < self._config.target_lock_frames:
+            return "S"
         pan_bias = self._pan_alignment_bias()
         threshold = max(1.0, float(self._config.follow_pan_align_threshold_deg))
         if pan_bias >= threshold:

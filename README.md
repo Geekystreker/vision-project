@@ -18,9 +18,6 @@ Use `requirements-gpu.txt` for the RTX/CUDA setup. The runtime model weights suc
 
 ## Current Network Defaults
 
-- Camera stream: `http://192.168.137.100:81/stream`
-- Driver node websocket: `ws://192.168.137.101:80/Jarvis`
-- Performance profile: `rtx5060`
 
 You can override these without editing code by setting:
 

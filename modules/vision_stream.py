@@ -221,10 +221,9 @@ class VisionStream:
             cv2 = None
 
         self._set_state(ConnectionState.CONNECTING)
-        transports: list[tuple[str, Callable[[], bool]]] = []
+        transports: list[tuple[str, Callable[[], bool]]] = [("raw-http", self._run_mjpeg_raw_http_once)]
         if cv2 is not None:
             transports.append(("ffmpeg", lambda: self._run_mjpeg_ffmpeg_once(cv2)))
-        transports.append(("raw-http", self._run_mjpeg_raw_http_once))
         if self._snapshot_candidates:
             transports.append(("snapshot", self._run_snapshot_fallbacks_once))
 
@@ -295,7 +294,10 @@ class VisionStream:
             with self._lock:
                 self._http_stream = stream
             self._on_transport_open("stream open")
-            bus.emit(SystemEvents.LOG_MESSAGE, "[VisionStream] MJPEG stream open. Waiting for first frame.")
+            bus.emit(
+                SystemEvents.LOG_MESSAGE,
+                "[VisionStream] Low-latency MJPEG stream open via urllib. Waiting for first frame.",
+            )
 
             buffer = bytearray()
             while self._running:
@@ -382,12 +384,13 @@ class VisionStream:
             return
 
         buffer.extend(chunk)
+        latest_payload: bytes | None = None
         while True:
             soi = buffer.find(b"\xff\xd8")
             if soi < 0:
                 if len(buffer) > 256_000:
                     del buffer[:-2]
-                return
+                break
             if soi > 0:
                 del buffer[:soi]
 
@@ -395,11 +398,15 @@ class VisionStream:
             if eoi < 0:
                 if len(buffer) > 1_000_000:
                     del buffer[: len(buffer) - 256_000]
-                return
+                break
 
-            payload = bytes(buffer[: eoi + 2])
+            # Keep only the newest complete JPEG from this network read. If the
+            # app is busy, older frames are discarded instead of becoming latency.
+            latest_payload = bytes(buffer[: eoi + 2])
             del buffer[: eoi + 2]
-            self._ingest_frame(payload)
+
+        if latest_payload is not None:
+            self._ingest_frame(latest_payload)
 
     def _watchdog_run(self) -> None:
         interval = min(0.25, max(0.05, self._config.camera_disconnect_timeout / 4))

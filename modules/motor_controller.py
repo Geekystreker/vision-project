@@ -1,14 +1,17 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import socket
 import threading
 import time
 from typing import Optional
+from urllib.parse import urlparse
 
 import websocket
 
 from config import RoverConfig
 from core.event_bus import SystemEvents, bus
+from modules.jarvis_protocol import move_packet, uses_json_protocol, uses_legacy_protocol
 from modules.rover_types import ConnectionState, ConnectionStatus
 
 
@@ -25,17 +28,21 @@ class MotorController:
     def __init__(self, url: str, config: RoverConfig) -> None:
         self._url = url
         self._config = config
+        self._transport = self._resolve_transport(url)
+        self._udp_target = self._resolve_udp_target(url)
         self._lock = threading.Lock()
         self._running = False
         self._started = False
         self._thread: Optional[threading.Thread] = None
         self._sender_thread: Optional[threading.Thread] = None
         self._app: Optional[websocket.WebSocketApp] = None
+        self._udp_socket: Optional[socket.socket] = None
         self._connected = False
         self._connected_event = threading.Event()
         self._send_event = threading.Event()
-        self._disabled = not bool((url or "").strip())
+        self._disabled = not bool((url or "").strip()) or (self._transport == "udp" and self._udp_target is None)
         self._pending_command: PendingMotorCommand | None = None
+        self._pending_followup_command: PendingMotorCommand | None = None
         self._last_sent_command = ""
         self._last_sent_at = 0.0
         self._last_waiting_log_at = 0.0
@@ -48,8 +55,11 @@ class MotorController:
             return
         self._running = True
         self._started = True
-        self._thread = threading.Thread(target=self._run, daemon=True, name="MotorController_Thread")
-        self._thread.start()
+        if self._transport == "udp":
+            self._start_udp_transport()
+        else:
+            self._thread = threading.Thread(target=self._run, daemon=True, name="MotorController_Thread")
+            self._thread.start()
         self._sender_thread = threading.Thread(
             target=self._sender_loop,
             daemon=True,
@@ -63,11 +73,19 @@ class MotorController:
         self._connected_event.clear()
         self._send_event.set()
         app = self._app
+        udp_socket = self._udp_socket
         if app is not None:
             try:
                 app.close()
             except Exception:
                 pass
+        if udp_socket is not None:
+            try:
+                udp_socket.close()
+            except Exception:
+                pass
+            self._udp_socket = None
+        self._set_state(ConnectionState.DISCONNECTED)
 
     def is_connected(self) -> bool:
         return self._connected and not self._disabled
@@ -82,7 +100,20 @@ class MotorController:
             return False
         command_key = (command or "").strip().upper()
         now = time.monotonic()
+        pending = PendingMotorCommand(
+            command=command_key,
+            payloads=payloads,
+            enqueued_at=now,
+        )
         with self._lock:
+            # A quick key tap can produce F then S before the sender thread wakes up.
+            # Preserve that order so movement is not swallowed by the stop command.
+            if command_key == "S" and self._pending_command is not None and self._pending_command.command != "S":
+                self._pending_followup_command = pending
+                self._send_event.set()
+                return True
+            if command_key != "S":
+                self._pending_followup_command = None
             if self._pending_command is not None and self._pending_command.command == command_key:
                 return True
             if (
@@ -90,19 +121,40 @@ class MotorController:
                 and (now - self._last_sent_at) < (1.0 / max(1, self._config.motor_send_hz))
             ):
                 return True
-            self._pending_command = PendingMotorCommand(
-                command=command_key,
-                payloads=payloads,
-                enqueued_at=now,
-            )
+            self._pending_command = pending
         self._send_event.set()
         return True
 
     def send_stop_now(self) -> bool:
         return self._send_payloads(self._payloads_for_command("S"), "S", time.monotonic())
 
+    def force_stop(self) -> bool:
+        """Clear queued movement and prioritize a stop packet immediately."""
+        payloads = self._payloads_for_command("S")
+        now = time.monotonic()
+        with self._lock:
+            stop_was_recent = (
+                self._last_sent_command == "S"
+                and (now - self._last_sent_at) < (1.0 / max(1, self._config.motor_send_hz))
+            )
+            self._pending_command = None
+            self._pending_followup_command = None
+        if stop_was_recent:
+            return True
+
+        if self._send_payloads(payloads, "S", now):
+            return True
+
+        with self._lock:
+            self._pending_command = PendingMotorCommand("S", payloads, now)
+            self._pending_followup_command = None
+        self._send_event.set()
+        return True
+
     def _send_payloads(self, payloads: tuple[str, ...], command_key: str, enqueued_at: float) -> bool:
         try:
+            if self._transport == "udp":
+                return self._send_udp_payloads(payloads, command_key, enqueued_at)
             with self._lock:
                 app = self._app
             if app and app.sock and app.sock.connected:
@@ -136,7 +188,12 @@ class MotorController:
         if command_speeds is None:
             return ()
         left_speed, right_speed = command_speeds
-        return (f"L,{left_speed}", f"R,{right_speed}")
+        payloads: list[str] = []
+        if uses_json_protocol(self._config):
+            payloads.append(move_packet(self._config, direction=cmd, left=left_speed, right=right_speed))
+        if uses_legacy_protocol(self._config):
+            payloads.extend((f"L,{left_speed}", f"R,{right_speed}"))
+        return tuple(payloads)
 
     @staticmethod
     def _clamp_speed(speed: int) -> int:
@@ -146,6 +203,10 @@ class MotorController:
         connected = state == ConnectionState.CONNECTED
         if self._connected != connected or detail:
             self._connected = connected
+            if connected:
+                self._connected_event.set()
+            else:
+                self._connected_event.clear()
             bus.emit(
                 SystemEvents.CONNECTION_STATUS_CHANGED,
                 ConnectionStatus(channel="motor", state=state, detail=detail),
@@ -203,6 +264,23 @@ class MotorController:
         finally:
             self._set_state(ConnectionState.DISCONNECTED)
 
+    def _start_udp_transport(self) -> None:
+        if self._udp_target is None:
+            self._disabled = True
+            self._set_state(ConnectionState.DISCONNECTED, "invalid UDP motor endpoint")
+            return
+        try:
+            udp_socket = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            udp_socket.setblocking(False)
+            self._udp_socket = udp_socket
+            self._set_state(ConnectionState.CONNECTED, f"udp://{self._udp_target[0]}:{self._udp_target[1]}")
+            bus.emit(SystemEvents.LOG_MESSAGE, "[MotorController] UDP transport ready for low-latency drive commands.")
+            self.send_stop_now()
+        except Exception as exc:
+            self._disabled = True
+            self._set_state(ConnectionState.ERROR, str(exc))
+            bus.emit(SystemEvents.LOG_MESSAGE, f"[MotorController] UDP setup error: {exc}")
+
     def _sender_loop(self) -> None:
         interval = 1.0 / max(1, self._config.motor_send_hz)
         while self._running:
@@ -241,14 +319,20 @@ class MotorController:
     def _take_pending_command(self) -> PendingMotorCommand | None:
         with self._lock:
             command = self._pending_command
-            self._pending_command = None
-            self._send_event.clear()
+            self._pending_command = self._pending_followup_command
+            self._pending_followup_command = None
+            if self._pending_command is None:
+                self._send_event.clear()
+            else:
+                self._send_event.set()
             return command
 
     def _restore_pending_command(self, command: PendingMotorCommand) -> None:
         with self._lock:
             if self._pending_command is None:
                 self._pending_command = command
+            elif command.command == "S":
+                self._pending_followup_command = command
         self._send_event.set()
 
     def _is_stale_motion_command(self, command: PendingMotorCommand) -> bool:
@@ -256,3 +340,39 @@ class MotorController:
             return False
         ttl = max(0.05, float(self._config.motor_command_ttl_seconds))
         return (time.monotonic() - command.enqueued_at) > ttl
+
+    def _send_udp_payloads(self, payloads: tuple[str, ...], command_key: str, enqueued_at: float) -> bool:
+        if self._udp_target is None:
+            return False
+        with self._lock:
+            udp_socket = self._udp_socket
+        if udp_socket is None:
+            return False
+        try:
+            host, port = self._udp_target
+            for payload in payloads:
+                udp_socket.sendto(payload.encode("utf-8"), (host, port))
+            with self._lock:
+                self._last_sent_command = command_key
+                self._last_sent_at = time.monotonic()
+            return True
+        except Exception as exc:
+            self._set_state(ConnectionState.ERROR, str(exc))
+            bus.emit(SystemEvents.LOG_MESSAGE, f"[MotorController] UDP send error: {exc}")
+            return False
+
+    @staticmethod
+    def _resolve_transport(url: str) -> str:
+        scheme = urlparse(str(url or "")).scheme.lower()
+        if scheme == "udp":
+            return "udp"
+        return "websocket"
+
+    @staticmethod
+    def _resolve_udp_target(url: str) -> tuple[str, int] | None:
+        parsed = urlparse(str(url or ""))
+        if parsed.scheme.lower() != "udp":
+            return None
+        if not parsed.hostname or parsed.port is None:
+            return None
+        return parsed.hostname, int(parsed.port)

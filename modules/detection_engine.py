@@ -4,6 +4,7 @@ from abc import ABC, abstractmethod
 from pathlib import Path
 from typing import Iterable
 
+import cv2
 import numpy as np
 
 from config import RoverConfig
@@ -112,8 +113,12 @@ class YOLO26Backend(DetectionBackend):
             kwargs["iou"] = self._config.detector_tracking_iou
             if self._config.detector_track_classes is not None:
                 kwargs["classes"] = list(self._config.detector_track_classes)
+            inference_frame = frame
+            if frame.ndim == 3 and frame.shape[2] >= 3:
+                # Ultralytics models are trained on RGB imagery; ESP32/OpenCV frames arrive as BGR.
+                inference_frame = cv2.cvtColor(frame[:, :, :3], cv2.COLOR_BGR2RGB)
             results = self._model.track(
-                frame,
+                inference_frame,
                 tracker=self._tracker_config,
                 persist=True,
                 **kwargs,
@@ -193,17 +198,26 @@ class DetectionEngine:
     def __init__(self, config: RoverConfig, backend: DetectionBackend | None = None) -> None:
         self._config = config
         self._backend = backend or YOLO26Backend(config)
+        self._face_cascade = None
+        self._face_cascades = []
+        self._face_ready = False
 
     def load(self) -> None:
-        self._backend.load()
+        self._load_face_detector()
+        if not self._face_only_mode():
+            self._backend.load()
 
     def ready(self) -> bool:
-        return self._backend.ready()
+        return self._backend.ready() or self._face_ready
 
     def detect(self, frame: np.ndarray) -> list[Detection]:
         if not isinstance(frame, np.ndarray) or frame.size == 0:
             return []
-        detections = self._backend.detect(frame)
+        if bool(getattr(self._config, "face_lock_enabled", False)):
+            faces = self._detect_faces(frame)
+            if faces or self._face_only_mode():
+                return self._deduplicate_detections(faces)
+        detections = self._backend.detect(frame) if self._backend.ready() else []
         return self._deduplicate_detections(detections)
 
     def select_primary(self, detections: list[Detection], label: str | None = None) -> Detection | None:
@@ -264,3 +278,87 @@ class DetectionEngine:
         if union <= 0:
             return 0.0
         return intersection / union
+
+    def _load_face_detector(self) -> None:
+        if not bool(getattr(self._config, "face_lock_enabled", False)):
+            self._face_ready = False
+            return
+        try:
+            import cv2
+
+            cascade_names = (
+                "haarcascade_frontalface_alt2.xml",
+                "haarcascade_frontalface_default.xml",
+                "haarcascade_profileface.xml",
+            )
+            cascades = []
+            for name in cascade_names:
+                cascade_path = Path(cv2.data.haarcascades) / name
+                cascade = cv2.CascadeClassifier(str(cascade_path))
+                if not cascade.empty():
+                    cascades.append(cascade)
+            if not cascades:
+                self._face_cascades = []
+                self._face_cascade = None
+                self._face_ready = False
+                bus.emit(SystemEvents.LOG_MESSAGE, "[DetectionEngine] Face cascade unavailable.")
+                return
+            self._face_cascades = cascades
+            self._face_cascade = cascades[0]
+            self._face_ready = True
+            bus.emit(SystemEvents.LOG_MESSAGE, f"[DetectionEngine] Face lock detector ready ({len(cascades)} cascades).")
+        except Exception as exc:
+            self._face_cascade = None
+            self._face_cascades = []
+            self._face_ready = False
+            bus.emit(SystemEvents.LOG_MESSAGE, f"[DetectionEngine] Face detector unavailable: {exc}")
+
+    def _detect_faces(self, frame: np.ndarray) -> list[Detection]:
+        if not self._face_cascades and self._face_cascade is not None:
+            self._face_cascades = [self._face_cascade]
+        if not self._face_cascades:
+            self._load_face_detector()
+        if not self._face_cascades or not self._face_ready:
+            return []
+
+        try:
+            import cv2
+
+            gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+            gray = cv2.equalizeHist(gray)
+            min_size = max(12, int(getattr(self._config, "face_detector_min_size_px", 24)))
+            faces = []
+            for cascade in self._face_cascades:
+                faces.extend(
+                    cascade.detectMultiScale(
+                        gray,
+                        scaleFactor=max(1.01, float(getattr(self._config, "face_detector_scale_factor", 1.08))),
+                        minNeighbors=max(1, int(getattr(self._config, "face_detector_min_neighbors", 4))),
+                        minSize=(min_size, min_size),
+                    )
+                )
+        except Exception:
+            return []
+
+        max_faces = max(1, int(getattr(self._config, "face_detector_max_faces", 3)))
+        ordered = sorted((tuple(map(int, face)) for face in faces), key=lambda item: item[2] * item[3], reverse=True)
+        detections: list[Detection] = []
+        for x, y, w, h in ordered[:max_faces]:
+            if w <= 0 or h <= 0:
+                continue
+            detections.append(
+                Detection(
+                    label="face",
+                    confidence=0.92,
+                    bbox=BoundingBox(x=x, y=y, w=w, h=h, confidence=0.92),
+                    source="opencv_face",
+                    class_id=-1,
+                    track_id=None,
+                )
+            )
+        return detections
+
+    def _face_only_mode(self) -> bool:
+        return bool(getattr(self._config, "face_lock_enabled", False)) and not bool(
+            getattr(self._config, "face_lock_yolo_fallback_enabled", False)
+        )

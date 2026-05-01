@@ -28,6 +28,20 @@ def test_tracker_locks_closest_to_center_first():
     assert tracker.locked_target_id() == 1
 
 
+def test_tracker_prefers_large_front_target_over_tiny_background_center():
+    cfg = RoverConfig("ws://cam", "ws://servo", "ws://motor")
+    tracker = TargetTracker(cfg)
+    detections = [
+        make_detection(21, 95, 95, 10, 10),
+        make_detection(22, 65, 58, 70, 84),
+    ]
+
+    target = tracker.update(detections, 200, 200)
+
+    assert target is not None
+    assert target.source_track_id == 22
+
+
 def test_tracker_ignores_other_ids_while_locked():
     cfg = RoverConfig("ws://cam", "ws://servo", "ws://motor")
     tracker = TargetTracker(cfg)

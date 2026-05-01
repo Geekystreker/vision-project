@@ -48,6 +48,26 @@ def test_keyboard_drive_command_enters_manual_mode():
     assert app._rover_controller.commands[-1] == "F"
 
 
+def test_keyboard_drive_command_does_not_reset_servo_pose():
+    arbiter = ControlArbiter()
+    app = RoverVisionApp(RoverConfig("ws://cam", "ws://servo", "ws://motor"), arbiter)
+    app._motor_controller = DummySender()
+    app._servo_controller = DummySender()
+    app._rover_controller = DummyRover()
+    app._tracking_controller._motor = app._motor_controller
+    app._tracking_controller._servo = app._servo_controller
+    app._tracking_controller._rover = app._rover_controller
+    app._tracking_controller._state.pan_angle = 132
+    app._tracking_controller._state.tilt_angle = 111
+
+    ok = app.send_drive_command("F", source="KEYBOARD")
+
+    assert ok is True
+    assert app._tracking_controller.current_angles() == (132, 111)
+    assert app._servo_controller.commands == []
+    assert app._motor_controller.commands[-1] == "F"
+
+
 def test_adjust_servo_updates_angles_and_enters_manual_mode():
     arbiter = ControlArbiter()
     app = RoverVisionApp(RoverConfig("ws://cam", "ws://servo", "ws://motor"), arbiter)
@@ -113,6 +133,62 @@ def test_describe_scene_uses_latest_snapshot_detections():
     assert "bottle" in description.lower()
 
 
+def test_tracking_detections_prefer_real_face_box_for_servo_lock():
+    app = RoverVisionApp(RoverConfig("ws://cam", "ws://servo", "ws://motor"))
+    person = Detection(label="person", confidence=0.9, bbox=BoundingBox(40, 10, 120, 180), track_id=7)
+    face = Detection(label="face", confidence=0.92, bbox=BoundingBox(82, 34, 36, 42), source="opencv_face")
+
+    result = app._build_tracking_detections([person, face], 240, 200)
+
+    assert len(result) == 1
+    assert result[0].label == "person"
+    assert result[0].source == "face_lock"
+    assert result[0].track_id == 7
+    assert result[0].bbox == face.bbox
+
+
+def test_tracking_detections_fallback_to_person_face_proxy():
+    app = RoverVisionApp(
+        RoverConfig("ws://cam", "ws://servo", "ws://motor", face_lock_yolo_fallback_enabled=True)
+    )
+    person = Detection(label="person", confidence=0.9, bbox=BoundingBox(40, 10, 120, 180), track_id=7)
+
+    result = app._build_tracking_detections([person], 240, 200)
+
+    assert len(result) == 1
+    assert result[0].source == "face_proxy"
+    assert result[0].track_id == 7
+    assert result[0].bbox.w < person.bbox.w
+    assert result[0].bbox.h < person.bbox.h
+    assert result[0].bbox.center_y < person.bbox.center_y
+
+
+def test_focus_display_hides_background_person_boxes_when_face_lock_enabled():
+    app = RoverVisionApp(RoverConfig("ws://cam", "ws://servo", "ws://motor"))
+    person = Detection(label="person", confidence=0.9, bbox=BoundingBox(40, 10, 120, 180), track_id=7)
+    face = Detection(label="face", confidence=0.92, bbox=BoundingBox(82, 34, 36, 42), source="opencv_face")
+
+    result = app._build_focus_display_detections([person, face], None)
+
+    assert len(result) == 1
+    assert result[0].label == "face"
+    assert result[0].bbox == face.bbox
+
+
+def test_display_target_is_labeled_face_not_person():
+    app = RoverVisionApp(RoverConfig("ws://cam", "ws://servo", "ws://motor"))
+    target = app._target_tracker.update(
+        [Detection(label="person", confidence=0.9, bbox=BoundingBox(82, 34, 36, 42), track_id=7)],
+        240,
+        200,
+    )
+
+    display_target = app._face_display_target(target)
+
+    assert display_target.label == "face"
+    assert display_target.bbox == target.bbox
+
+
 def test_missing_frame_in_follow_mode_stops_and_clears_target():
     arbiter = ControlArbiter()
     app = RoverVisionApp(RoverConfig("ws://cam", "ws://servo", "ws://motor"), arbiter)
@@ -176,10 +252,10 @@ def test_follow_mode_missing_target_preserves_current_servo_angles():
     assert app._tracking_controller.current_angles() == (132, 74)
     assert app._rover_controller.commands[-1] == "S"
     assert app._motor_controller.commands[-1] == "S"
-    assert app._servo_controller.commands == []
+    assert app._servo_controller.commands[-2:] == ["Pan,132", "Tilt,74"]
 
 
-def test_follow_mode_short_occlusion_keeps_prediction_alive_without_reset():
+def test_follow_mode_missing_target_stops_prediction_and_holds_pose():
     arbiter = ControlArbiter()
     app = RoverVisionApp(RoverConfig("ws://cam", "ws://servo", "ws://motor"), arbiter)
     app._motor_controller = DummySender()
@@ -197,15 +273,54 @@ def test_follow_mode_short_occlusion_keeps_prediction_alive_without_reset():
 
     app._apply_detection_actions(ControlMode.FOLLOW_PERSON, target, [target.detection], 240, 200)
     before_servo_count = len(app._servo_controller.commands)
+    before_pose = app._tracking_controller.current_angles()
+    app._tracking_controller._state.last_detection_time = 0.0
     app._apply_detection_actions(ControlMode.FOLLOW_PERSON, None, [], 240, 200)
 
-    assert app._tracking_controller.tracking_status() == "PREDICT"
-    assert app._tracking_controller.predicted_point() is not None
+    assert app._tracking_controller.tracking_status() == "SEARCH"
+    assert app._tracking_controller.current_angles() == before_pose
+    assert app._tracking_controller.predicted_point() is None
     assert app._last_command == "S"
     assert len(app._servo_controller.commands) >= before_servo_count
 
 
-def test_autonomous_mode_aims_servos_at_locked_target_and_drives():
+def test_follow_mode_bridges_short_visual_gap_but_stops_motors():
+    arbiter = ControlArbiter()
+    app = RoverVisionApp(
+        RoverConfig(
+            "ws://cam",
+            "ws://servo",
+            "ws://motor",
+            tracking_loss_bridge_seconds=0.5,
+            servo_min_delta_deg=0.1,
+        ),
+        arbiter,
+    )
+    app._motor_controller = DummySender()
+    app._servo_controller = DummySender()
+    app._rover_controller = DummyRover()
+    app._tracking_controller._motor = app._motor_controller
+    app._tracking_controller._servo = app._servo_controller
+    app._tracking_controller._rover = app._rover_controller
+    app.set_follow_mode()
+    target = app._target_tracker.update(
+        [Detection(label="person", confidence=0.9, bbox=BoundingBox(150, 70, 40, 70), track_id=4)],
+        240,
+        200,
+    )
+
+    app._apply_detection_actions(ControlMode.FOLLOW_PERSON, target, [target.detection], 240, 200)
+    app._tracking_controller._state.last_pan_delta = 2.0
+    app._tracking_controller._state.last_tilt_delta = -2.0
+    app._apply_detection_actions(ControlMode.FOLLOW_PERSON, None, [], 240, 200)
+
+    assert app._tracking_controller.tracking_status() == "BRIDGE"
+    assert app._last_command == "S"
+    assert app._rover_controller.commands[-1] == "S"
+    assert app._motor_controller.commands[-1] == "S"
+
+
+def test_autonomous_mode_aims_servos_at_locked_target_without_driving_motors():
     arbiter = ControlArbiter()
     app = RoverVisionApp(RoverConfig("ws://cam", "ws://servo", "ws://motor"), arbiter)
     app._motor_controller = DummySender()
@@ -230,7 +345,10 @@ def test_autonomous_mode_aims_servos_at_locked_target_and_drives():
     assert target is not None
     assert any(command.startswith("Pan,") for command in app._servo_controller.commands)
     assert app._rover_controller.commands
-    assert app._last_command in {"F", "B", "L", "R", "S"}
+    assert set(app._rover_controller.commands) == {"S"}
+    assert app._motor_controller.commands
+    assert set(app._motor_controller.commands) == {"S"}
+    assert app._last_command == "S"
 
 
 def test_engage_autonomous_target_lock_centers_servos_and_sets_mode():

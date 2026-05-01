@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from collections import deque
 import time
 from dataclasses import dataclass, field
 from typing import Optional
@@ -12,6 +13,33 @@ from modules.pid_controller import PIDController
 from modules.rover_control import RoverController
 from modules.rover_types import TrackedTarget
 from modules.servo_controller import ServoController
+
+
+class MovingAverage2D:
+    """Small fixed-window average for noisy detection centers."""
+
+    def __init__(self, window_size: int) -> None:
+        self._window_size = max(1, int(window_size))
+        self._samples: deque[tuple[float, float]] = deque()
+        self._sum_x = 0.0
+        self._sum_y = 0.0
+
+    def reset(self) -> None:
+        self._samples.clear()
+        self._sum_x = 0.0
+        self._sum_y = 0.0
+
+    def update(self, x: float, y: float) -> tuple[float, float]:
+        if len(self._samples) >= self._window_size:
+            old_x, old_y = self._samples.popleft()
+            self._sum_x -= old_x
+            self._sum_y -= old_y
+        sample = (float(x), float(y))
+        self._samples.append(sample)
+        self._sum_x += sample[0]
+        self._sum_y += sample[1]
+        count = max(1, len(self._samples))
+        return self._sum_x / count, self._sum_y / count
 
 
 @dataclass(slots=True)
@@ -30,6 +58,7 @@ class TrackingState:
     active_target_id: int | None = None
     last_pan_delta: float = 0.0
     last_tilt_delta: float = 0.0
+    last_seen_servo_pose: tuple[int, int] | None = None
 
 
 class TrackingController:
@@ -53,6 +82,7 @@ class TrackingController:
             process_noise=config.kalman_process_noise,
             measurement_noise=config.kalman_measurement_noise,
         )
+        self._measurement_filter = MovingAverage2D(config.tracking_moving_average_window)
         self._pan_pid = PIDController(
             kp=config.pan_pid_kp,
             ki=config.pan_pid_ki,
@@ -86,21 +116,17 @@ class TrackingController:
         self._state.last_update_time = now
 
         if target is None:
-            predicted = self._predict_target_center(dt, frame_w, frame_h)
-            if predicted is not None:
-                self._apply_servo_to_point(predicted.x, predicted.y, frame_w, frame_h, dt)
-                self._state.target_locked = True
-                self._state.last_tracking_status = "PREDICT"
-                return "PREDICT"
-            self._state.target_locked = False
-            self._state.predicted_point = None
-            self._state.active_target_id = None
-            self._state.last_pan_delta = 0.0
-            self._state.last_tilt_delta = 0.0
-            self._pan_pid.reset()
-            self._tilt_pid.reset()
-            self._state.last_tracking_status = "IDLE"
-            return "IDLE"
+            if self._bridge_recent_detection_gap(dt):
+                return self._state.last_tracking_status
+            if bool(getattr(self._config, "tracking_predict_on_loss", False)):
+                predicted = self._predict_target_center(dt, frame_w, frame_h)
+                if predicted is not None:
+                    self._apply_servo_to_point(predicted.x, predicted.y, frame_w, frame_h, dt)
+                    self._state.target_locked = True
+                    self._state.last_tracking_status = "PREDICT"
+                    return "PREDICT"
+            self.hold_last_seen_pose()
+            return self._state.last_tracking_status
 
         if self._state.active_target_id != target.target_id:
             self._start_target_session(target.target_id)
@@ -109,13 +135,16 @@ class TrackingController:
         measured_x, measured_y = self._smooth_measurement(target.bbox.center_x, target.bbox.center_y)
         estimate = self._kalman.update(measured_x, measured_y, dt)
         self._state.prediction_frames = 0
-        self._state.predicted_point = self._clamp_point(estimate.x, estimate.y, frame_w, frame_h)
-        offset_x, offset_y = self._compute_offsets_from_point(estimate.x, estimate.y, frame_w, frame_h)
+        latency = max(0.0, float(getattr(self._config, "servo_hardware_latency_seconds", 0.0)))
+        aim_point = self._kalman.project(latency) or estimate
+        self._state.predicted_point = self._clamp_point(aim_point.x, aim_point.y, frame_w, frame_h)
+        offset_x, offset_y = self._compute_offsets_from_point(aim_point.x, aim_point.y, frame_w, frame_h)
         self._state.target_locked = self._within_dead_zone(offset_x, offset_y) and (
             target.stable_frames >= self._config.target_lock_frames
         )
 
-        self._apply_servo_to_point(estimate.x, estimate.y, frame_w, frame_h, dt)
+        self._apply_servo_to_point(aim_point.x, aim_point.y, frame_w, frame_h, dt)
+        self._state.last_seen_servo_pose = self.current_angles()
         self._state.last_tracking_status = "TRACK"
         return "TRACK"
 
@@ -123,6 +152,7 @@ class TrackingController:
         self._state.pan_angle = self._clamp_pan_angle(self._state.pan_angle + pan_delta)
         self._state.tilt_angle = self._clamp_tilt_angle(self._state.tilt_angle + tilt_delta)
         self._state.target_locked = False
+        self._state.last_seen_servo_pose = self.current_angles()
         self._pan_pid.reset()
         self._tilt_pid.reset()
         pan = int(round(self._state.pan_angle))
@@ -143,6 +173,7 @@ class TrackingController:
             tilt_center = int(self._clamp_tilt_angle(center))
             self._state.pan_angle = float(pan_center)
             self._state.tilt_angle = float(tilt_center)
+            self._state.last_seen_servo_pose = (pan_center, tilt_center)
             self._dispatch_drive("S")
             self._dispatch_servo(pan_center, tilt_center)
         except Exception as exc:
@@ -152,6 +183,7 @@ class TrackingController:
         self._pan_pid.reset()
         self._tilt_pid.reset()
         self._kalman.reset()
+        self._measurement_filter.reset()
         self._state.target_locked = False
         self._state.prediction_frames = 0
         self._state.predicted_point = None
@@ -160,6 +192,19 @@ class TrackingController:
         self._state.active_target_id = None
         self._state.last_pan_delta = 0.0
         self._state.last_tilt_delta = 0.0
+
+    def hold_last_seen_pose(self) -> tuple[int, int]:
+        """Stop predictive motion and keep the camera at the last confirmed target pose."""
+        pose = self._state.last_seen_servo_pose or self.current_angles()
+        pan = int(round(self._clamp_pan_angle(float(pose[0]))))
+        tilt = int(round(self._clamp_tilt_angle(float(pose[1]))))
+        self._state.pan_angle = float(pan)
+        self._state.tilt_angle = float(tilt)
+        self.clear_lock_state()
+        self._state.last_seen_servo_pose = (pan, tilt)
+        self._state.last_tracking_status = "SEARCH"
+        self._dispatch_servo(pan, tilt)
+        return pan, tilt
 
     def current_angles(self) -> tuple[int, int]:
         return int(round(self._state.pan_angle)), int(round(self._state.tilt_angle))
@@ -185,6 +230,19 @@ class TrackingController:
             self._motor.send(command)
             self._state.last_drive_command = command
         return command
+
+    def stop_drive(self) -> str:
+        return self._dispatch_drive("S")
+
+    def hard_stop_drive(self) -> str:
+        self._rover.send_command("S")
+        force_stop = getattr(self._motor, "force_stop", None)
+        if callable(force_stop):
+            force_stop()
+        else:
+            self._motor.send("S")
+        self._state.last_drive_command = "S"
+        return "S"
 
     def _dispatch_servo(self, pan: int, tilt: int) -> None:
         command = (pan, tilt)
@@ -228,17 +286,31 @@ class TrackingController:
         error_y = self._normalize_error(offset_y, frame_h)
         if abs(offset_x) <= deadband:
             error_x = 0.0
+            self._state.last_pan_delta = 0.0
             self._pan_pid.reset()
         if abs(offset_y) <= deadband:
             error_y = 0.0
+            self._state.last_tilt_delta = 0.0
             self._tilt_pid.reset()
         if error_x == 0.0 and error_y == 0.0:
             return
 
-        pan_direction = 1.0 if self._config.servo_manual_pan_direction >= 0 else -1.0
-        tilt_direction = 1.0 if self._config.servo_manual_tilt_direction >= 0 else -1.0
-        pan_delta = pan_direction * self._pan_pid.update(error_x, dt)
-        tilt_delta = tilt_direction * self._tilt_pid.update(error_y, dt)
+        pan_direction = 1.0 if self._config.servo_tracking_pan_direction >= 0 else -1.0
+        tilt_direction = 1.0 if self._config.servo_tracking_tilt_direction >= 0 else -1.0
+        pan_delta = 0.0
+        tilt_delta = 0.0
+        if error_x != 0.0:
+            pan_delta = (
+                pan_direction
+                * self._pan_pid.update(error_x, dt)
+                * self._axis_ease(abs(offset_x), frame_w, deadband)
+            )
+        if error_y != 0.0:
+            tilt_delta = (
+                tilt_direction
+                * self._tilt_pid.update(error_y, dt)
+                * self._axis_ease(abs(offset_y), frame_h, deadband)
+            )
         max_delta = max(0.0, float(self._config.servo_max_speed_deg_per_sec)) * max(1e-3, dt)
         if max_delta > 0.0:
             pan_delta = max(-max_delta, min(max_delta, pan_delta))
@@ -273,6 +345,7 @@ class TrackingController:
         self._state.active_target_id = target_id
         self._state.last_pan_delta = 0.0
         self._state.last_tilt_delta = 0.0
+        self._measurement_filter.reset()
 
     def _smooth_axis_delta(self, delta: float, previous_delta: float) -> float:
         if delta == 0.0:
@@ -284,7 +357,52 @@ class TrackingController:
             return delta
         return (alpha * delta) + ((1.0 - alpha) * previous_delta)
 
+    def _bridge_recent_detection_gap(self, dt: float) -> bool:
+        """Coast briefly through one network/inference hiccup, then yield to safe hold."""
+        bridge_seconds = max(0.0, float(getattr(self._config, "tracking_loss_bridge_seconds", 0.0)))
+        if bridge_seconds <= 0.0:
+            return False
+        gap = time.monotonic() - self._state.last_detection_time
+        if gap > bridge_seconds:
+            return False
+        if self._state.last_seen_servo_pose is None:
+            return False
+
+        scale = max(0.0, min(1.0, float(getattr(self._config, "tracking_loss_bridge_velocity_scale", 0.5))))
+        pan_delta = self._state.last_pan_delta * scale
+        tilt_delta = self._state.last_tilt_delta * scale
+        max_delta = max(0.0, float(self._config.servo_max_speed_deg_per_sec)) * max(1e-3, dt)
+        if max_delta > 0.0:
+            pan_delta = max(-max_delta, min(max_delta, pan_delta))
+            tilt_delta = max(-max_delta, min(max_delta, tilt_delta))
+
+        min_delta = max(0.25, float(self._config.servo_min_delta_deg) * 0.5)
+        if abs(pan_delta) < min_delta:
+            pan_delta = 0.0
+        if abs(tilt_delta) < min_delta:
+            tilt_delta = 0.0
+        if pan_delta == 0.0 and tilt_delta == 0.0:
+            return False
+
+        self._state.pan_angle = self._clamp_pan_angle(self._state.pan_angle + pan_delta)
+        self._state.tilt_angle = self._clamp_tilt_angle(self._state.tilt_angle + tilt_delta)
+        self._state.last_pan_delta = pan_delta
+        self._state.last_tilt_delta = tilt_delta
+        self._state.target_locked = False
+        self._state.predicted_point = None
+        self._state.last_tracking_status = "BRIDGE"
+        self._dispatch_servo(int(round(self._state.pan_angle)), int(round(self._state.tilt_angle)))
+        return True
+
+    def _axis_ease(self, abs_offset: float, frame_span: int, deadband: int) -> float:
+        active_span = max(1.0, (frame_span / 2.0) - float(deadband))
+        normalized = max(0.0, min(1.0, (float(abs_offset) - float(deadband)) / active_span))
+        min_ease = max(0.05, min(1.0, float(self._config.servo_easing_min)))
+        exponent = max(0.1, float(self._config.servo_easing_exponent))
+        return min_ease + ((1.0 - min_ease) * (normalized**exponent))
+
     def _smooth_measurement(self, x: float, y: float) -> tuple[float, float]:
+        x, y = self._measurement_filter.update(x, y)
         alpha = max(0.0, min(1.0, float(self._config.tracking_measurement_alpha)))
         previous = self._state.smoothed_target_point
         if previous is None or alpha >= 1.0:
@@ -364,5 +482,5 @@ class TrackingController:
     def _pan_alignment_bias(self) -> float:
         center = float(self._config.servo_center_angle)
         pan_error = self._state.pan_angle - center
-        pan_direction = 1.0 if self._config.servo_manual_pan_direction >= 0 else -1.0
+        pan_direction = 1.0 if self._config.servo_tracking_pan_direction >= 0 else -1.0
         return pan_error * pan_direction

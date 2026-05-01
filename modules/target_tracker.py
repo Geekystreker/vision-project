@@ -283,14 +283,31 @@ class TargetTracker:
             return 0.0
         return intersection / union
 
-    @staticmethod
-    def _acquire_target(candidates: list[Detection], frame_w: int, frame_h: int) -> Detection | None:
+    def _acquire_target(self, candidates: list[Detection], frame_w: int, frame_h: int) -> Detection | None:
         center_x = frame_w / 2.0
         center_y = frame_h / 2.0
-        return min(
-            candidates,
-            key=lambda item: (
-                (item.bbox.center_x - center_x) ** 2 + (item.bbox.center_y - center_y) ** 2,
-                -item.area,
-            ),
-        )
+        frame_area = max(1.0, float(frame_w * frame_h))
+        frame_diag_sq = max(1.0, float((frame_w * frame_w) + (frame_h * frame_h)))
+        center_weight = max(0.0, float(getattr(self._config, "target_center_weight", 0.65)))
+        front_weight = max(0.0, float(getattr(self._config, "target_front_area_weight", 2.4)))
+        min_area_fraction = max(0.0, float(getattr(self._config, "target_min_acquire_area_fraction", 0.0)))
+        min_area = frame_area * min_area_fraction
+        usable_candidates = [item for item in candidates if float(item.area) >= min_area]
+        if not usable_candidates:
+            usable_candidates = candidates
+        largest_area = max(1, max(item.area for item in usable_candidates))
+
+        def score(item: Detection) -> tuple[float, float]:
+            dx = item.bbox.center_x - center_x
+            dy = item.bbox.center_y - center_y
+            center_norm = ((dx * dx) + (dy * dy)) / frame_diag_sq
+            area_fraction = float(item.area) / frame_area
+            confidence = max(0.0, min(1.0, float(item.confidence)))
+            source = (item.source or "").strip().lower()
+            source_bonus = 0.06 if source in {"face_lock", "opencv_face", "face_proxy"} else 0.0
+            size_ratio = float(item.area) / float(largest_area)
+            # Front/center targets win; tiny background boxes need to be almost perfectly centered.
+            front_score = (center_weight * center_norm) - (front_weight * area_fraction) - (0.05 * confidence) - source_bonus
+            return front_score, -size_ratio
+
+        return min(usable_candidates, key=score)

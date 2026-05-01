@@ -7,6 +7,7 @@ import time
 from collections import Counter
 from typing import Callable, Optional
 from urllib import request
+from urllib.parse import urlparse, urlunparse
 
 from config import Config
 from core.event_bus import SystemEvents, bus
@@ -46,7 +47,7 @@ def humanize(text: str) -> str:
 
 
 class OllamaAIEngine:
-    def __init__(self, knowledge_base: Optional[KnowledgeBase] = None):
+    def __init__(self, knowledge_base: Optional[KnowledgeBase] = None, *, healthcheck: bool = True):
         self._endpoint = Config.OLLAMA_ENDPOINT
         self._model = Config.OLLAMA_MODEL
         self._timeout = Config.API_TIMEOUT
@@ -55,6 +56,47 @@ class OllamaAIEngine:
         self._scene_backoff_until = 0.0
         self._scene_lock = threading.Lock()
         bus.emit(SystemEvents.LOG_MESSAGE, f"[Ollama] Initialized using local model: {self._model}")
+        if healthcheck:
+            self.refresh_status_async()
+
+    def refresh_status_async(self) -> None:
+        threading.Thread(
+            target=self._refresh_status,
+            daemon=True,
+            name="OllamaHealth_Thread",
+        ).start()
+
+    def _refresh_status(self) -> None:
+        self._emit_status(ConnectionState.CONNECTING, "checking local Ollama")
+        try:
+            req = request.Request(self._tags_endpoint(), method="GET")
+            with request.urlopen(req, timeout=2.0) as resp:
+                body = resp.read().decode("utf-8", errors="replace")
+            parsed = json.loads(body) if body else {}
+            models = parsed.get("models")
+            if isinstance(models, list):
+                names = {
+                    str(item.get("name", "")).strip()
+                    for item in models
+                    if isinstance(item, dict) and str(item.get("name", "")).strip()
+                }
+                if names and self._model not in names:
+                    self._emit_status(ConnectionState.ERROR, f"model missing: {self._model}")
+                    return
+            self._emit_status(ConnectionState.CONNECTED, self._model)
+        except Exception as exc:
+            self._emit_status(ConnectionState.ERROR, str(exc))
+
+    def _tags_endpoint(self) -> str:
+        parsed = urlparse(self._endpoint)
+        return urlunparse((parsed.scheme, parsed.netloc, "/api/tags", "", "", ""))
+
+    @staticmethod
+    def _emit_status(state: ConnectionState, detail: str = "") -> None:
+        bus.emit(
+            SystemEvents.CONNECTION_STATUS_CHANGED,
+            ConnectionStatus(channel="ollama", state=state, detail=detail),
+        )
 
     def _post_generate(
         self,
@@ -79,16 +121,10 @@ class OllamaAIEngine:
             with request.urlopen(req, timeout=timeout or self._timeout) as resp:
                 body = resp.read().decode("utf-8", errors="replace")
             parsed = json.loads(body)
-            bus.emit(
-                SystemEvents.CONNECTION_STATUS_CHANGED,
-                ConnectionStatus(channel="ollama", state=ConnectionState.CONNECTED, detail=self._model),
-            )
+            self._emit_status(ConnectionState.CONNECTED, self._model)
             return str(parsed.get("response", "")).strip()
         except Exception as exc:
-            bus.emit(
-                SystemEvents.CONNECTION_STATUS_CHANGED,
-                ConnectionStatus(channel="ollama", state=ConnectionState.ERROR, detail=str(exc)),
-            )
+            self._emit_status(ConnectionState.ERROR, str(exc))
             if not suppress_log:
                 bus.emit(SystemEvents.LOG_MESSAGE, f"[Ollama] Request failed: {exc}")
             return None

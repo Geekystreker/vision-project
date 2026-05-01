@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import math
 import time
+from typing import Sequence
 
 import cv2
 import numpy as np
@@ -16,7 +17,7 @@ class JarvisHUDRenderer:
     def render(
         self,
         frame: np.ndarray,
-        detections: list[Detection],
+        detections: Sequence[Detection],
         target: TrackedTarget | None,
         mode: ControlMode,
         telemetry: dict[str, object],

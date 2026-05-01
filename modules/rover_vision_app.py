@@ -3,7 +3,7 @@ from __future__ import annotations
 import logging
 import threading
 import time
-from typing import Optional
+from typing import Optional, Sequence
 
 import cv2
 import numpy as np
@@ -43,7 +43,7 @@ class RoverVisionApp:
         self._latest_inference_ms = 0.0
         self._latest_camera_frame: Optional[np.ndarray] = None
         self._frame_handoff_lock = threading.Lock()
-        self._latest_detections = []
+        self._latest_detections: list[Detection] = []
         self._latest_target = None
         self._latest_detection_mode = ControlMode.IDLE
         self._detection_interval = 1.0 / max(1, self._config.detection_hz)
@@ -183,6 +183,11 @@ class RoverVisionApp:
             self._autonomous_controller.reset()
             self._target_tracker.clear()
             self._last_command = "S"
+        else:
+            self._tracking_controller.clear_lock_state()
+            self._autonomous_controller.reset()
+            self._target_tracker.clear()
+            self._last_command = self._tracking_controller.hard_stop_drive()
         return mode
 
     def toggle_autonomous_mode(self) -> ControlMode:
@@ -198,6 +203,7 @@ class RoverVisionApp:
     def engage_autonomous_target_lock(self) -> ControlMode:
         self._tracking_controller.reset()
         self._autonomous_controller.reset()
+        self._tracking_controller.hard_stop_drive()
         self._target_tracker.clear()
         self._last_command = "S"
         mode = self._arbiter.set_autonomous_mode()
@@ -206,6 +212,9 @@ class RoverVisionApp:
 
     def set_follow_mode(self) -> ControlMode:
         self._autonomous_controller.reset()
+        self._tracking_controller.clear_lock_state()
+        self._target_tracker.clear()
+        self._last_command = self._tracking_controller.hard_stop_drive()
         return self._arbiter.set_follow_mode()
 
     def set_autonomous_mode(self) -> ControlMode:
@@ -248,20 +257,22 @@ class RoverVisionApp:
         self._camera_missing_notice_emitted = False
 
         with self._frame_handoff_lock:
-            self._latest_camera_frame = frame.copy()
+            self._latest_camera_frame = frame
 
-        self._schedule_detection(mode)
+        self._schedule_detection(mode, frame)
 
         with self._detection_state_lock:
-            detections = list(self._latest_detections)
+            detections = self._latest_detections
             target = self._latest_target
 
         if mode in {ControlMode.FOLLOW_PERSON, ControlMode.AUTONOMOUS} and self._vision_stream.frame_age() > self._config.frame_stale_seconds:
-            self._tracking_controller.reset()
+            self._target_tracker.clear()
+            self._tracking_controller.hold_last_seen_pose()
+            self._tracking_controller.hard_stop_drive()
             self._autonomous_controller.reset()
             self._last_command = "S"
 
-        display = self._render_overlay(frame.copy(), detections, target, mode)
+        display = self._render_overlay(frame, detections, target, mode)
         rgb = cv2.cvtColor(display, cv2.COLOR_BGR2RGB)
         self._publish_snapshot(rgb, detections, target, mode)
 
@@ -276,8 +287,9 @@ class RoverVisionApp:
         with self._frame_handoff_lock:
             self._latest_camera_frame = None
         if mode in {ControlMode.FOLLOW_PERSON, ControlMode.AUTONOMOUS}:
-            self._tracking_controller.reset()
+            self._tracking_controller.hold_last_seen_pose()
             self._autonomous_controller.reset()
+            self._tracking_controller.hard_stop_drive()
             self._last_command = "S"
         elif (
             not self._camera_missing_notice_emitted
@@ -292,17 +304,18 @@ class RoverVisionApp:
                 "[RoverVisionApp] Camera unavailable. Driver node controls remain online for manual drive/servo.",
             )
 
-    def _schedule_detection(self, mode: ControlMode) -> None:
+    def _schedule_detection(self, mode: ControlMode, frame: Optional[np.ndarray] = None) -> None:
         now = time.monotonic()
         if self._detection_busy:
             return
         if (now - self._last_detection_submit) < self._detection_interval:
             return
 
-        with self._frame_handoff_lock:
-            if self._latest_camera_frame is None:
-                return
-            frame = self._latest_camera_frame.copy()
+        if frame is None:
+            with self._frame_handoff_lock:
+                if self._latest_camera_frame is None:
+                    return
+                frame = self._latest_camera_frame
 
         detect_frame = frame
         scale_x = 1.0
@@ -344,7 +357,9 @@ class RoverVisionApp:
                 continue
 
             detections: list[Detection] = []
+            display_detections: list[Detection] = []
             target = None
+            display_target = None
             try:
                 self._ensure_detection_loaded()
                 if self._detection_loaded:
@@ -356,18 +371,29 @@ class RoverVisionApp:
 
                 if scale_x != 1.0 or scale_y != 1.0:
                     detections = [self._scale_detection(det, scale_x, scale_y, frame_w, frame_h) for det in detections]
-                target = self._target_tracker.update(detections, frame_w, frame_h)
-                bus.emit(SystemEvents.DETECTIONS_UPDATED, detections)
-                if not detections:
+                tracking_detections = self._build_tracking_detections(detections, frame_w, frame_h)
+                if tracking_detections:
+                    target = self._target_tracker.update(tracking_detections, frame_w, frame_h)
+                else:
+                    if self._target_tracker.current_target() is not None:
+                        self._target_tracker.clear()
+                    target = None
+                display_target = self._face_display_target(target) if target is not None else None
+                display_detections = self._build_focus_display_detections(detections, display_target)
+                bus.emit(
+                    SystemEvents.DETECTIONS_UPDATED,
+                    [display_target.detection] if display_target is not None else display_detections,
+                )
+                if not display_detections and display_target is None:
                     bus.emit(SystemEvents.ROVER_NO_DETECTION, None)
-                self._apply_detection_actions(mode, target, detections, frame_w, frame_h)
+                self._apply_detection_actions(mode, target, display_detections, frame_w, frame_h)
             except Exception as exc:
                 self._latest_inference_ms = 0.0
                 bus.emit(SystemEvents.LOG_MESSAGE, f"[RoverVisionApp] detection loop error: {exc}")
             finally:
                 with self._detection_state_lock:
-                    self._latest_detections = list(detections)
-                    self._latest_target = target
+                    self._latest_detections = display_detections
+                    self._latest_target = display_target
                     self._detection_busy = False
 
     def _apply_detection_actions(
@@ -380,17 +406,140 @@ class RoverVisionApp:
     ) -> None:
         if mode == ControlMode.FOLLOW_PERSON:
             if self._arbiter.allow_autonomy():
+                if target is None:
+                    self._tracking_controller.update_servos(None, frame_w, frame_h)
+                    self._last_command = self._tracking_controller.hard_stop_drive()
+                    return
                 self._last_command = self._tracking_controller.update(target, frame_w, frame_h)
             return
 
         if mode == ControlMode.AUTONOMOUS:
             if self._arbiter.allow_autonomy():
+                if target is None:
+                    self._tracking_controller.update_servos(None, frame_w, frame_h)
+                    self._last_command = self._tracking_controller.hard_stop_drive()
+                    return
                 self._tracking_controller.update_servos(target, frame_w, frame_h)
-                self._last_command = self._autonomous_controller.update(detections, frame_w, frame_h)
+                self._last_command = self._tracking_controller.hard_stop_drive()
             return
 
         if mode != ControlMode.INSPECT_SCENE and self._tracking_controller.target_locked():
             self._tracking_controller.clear_lock_state()
+
+    def _build_tracking_detections(
+        self,
+        detections: list[Detection],
+        frame_w: int,
+        frame_h: int,
+    ) -> list[Detection]:
+        if not bool(getattr(self._config, "face_lock_enabled", True)):
+            return list(detections)
+
+        target_label = self._config.target_label
+        people = [item for item in detections if (item.label or "").strip().lower() == target_label.lower()]
+        faces = [item for item in detections if (item.label or "").strip().lower() == "face"]
+        if faces:
+            return [self._face_as_tracking_target(face, people) for face in faces]
+        if people and bool(getattr(self._config, "face_lock_yolo_fallback_enabled", False)):
+            return [self._person_as_face_proxy(person, frame_w, frame_h) for person in people]
+        return []
+
+    def _face_as_tracking_target(self, face: Detection, people: list[Detection]) -> Detection:
+        matched_track_id = self._match_face_to_person_track(face, people)
+        return Detection(
+            label=self._config.target_label,
+            confidence=face.confidence,
+            bbox=face.bbox,
+            source="face_lock",
+            class_id=face.class_id,
+            track_id=matched_track_id,
+        )
+
+    @staticmethod
+    def _match_face_to_person_track(face: Detection, people: list[Detection]) -> int | None:
+        if not people:
+            return None
+        face_x = face.bbox.center_x
+        face_y = face.bbox.center_y
+        containing = [
+            person
+            for person in people
+            if person.track_id is not None
+            and person.bbox.x <= face_x <= person.bbox.x + person.bbox.w
+            and person.bbox.y <= face_y <= person.bbox.y + person.bbox.h
+        ]
+        if containing:
+            return min(
+                containing,
+                key=lambda person: (face_x - person.bbox.center_x) ** 2 + (face_y - person.bbox.center_y) ** 2,
+            ).track_id
+        tracked = [person for person in people if person.track_id is not None]
+        if not tracked:
+            return None
+        return min(
+            tracked,
+            key=lambda person: (face_x - person.bbox.center_x) ** 2 + (face_y - person.bbox.y) ** 2,
+        ).track_id
+
+    def _person_as_face_proxy(self, person: Detection, frame_w: int, frame_h: int) -> Detection:
+        box = person.bbox
+        face_w = max(12, int(round(box.w * float(self._config.face_proxy_width_fraction))))
+        face_h = max(12, int(round(box.h * float(self._config.face_proxy_height_fraction))))
+        face_w = min(face_w, max(1, box.w))
+        face_h = min(face_h, max(1, box.h))
+        x = int(round(box.x + ((box.w - face_w) / 2.0)))
+        y = int(round(box.y + (box.h * float(self._config.face_proxy_y_fraction))))
+        x = max(0, min(max(0, frame_w - face_w), x))
+        y = max(0, min(max(0, frame_h - face_h), y))
+        confidence = max(0.01, min(1.0, float(person.confidence) * 0.82))
+        return Detection(
+            label=self._config.target_label,
+            confidence=confidence,
+            bbox=BoundingBox(x=x, y=y, w=face_w, h=face_h, confidence=confidence),
+            source="face_proxy",
+            class_id=person.class_id,
+            track_id=person.track_id,
+        )
+
+    def _build_focus_display_detections(
+        self,
+        detections: list[Detection],
+        display_target,
+    ) -> list[Detection]:
+        if not bool(getattr(self._config, "face_lock_enabled", True)):
+            return list(detections)
+        if display_target is not None:
+            return []
+        faces = [item for item in detections if (item.label or "").strip().lower() == "face"]
+        return [
+            Detection(
+                label="face",
+                confidence=face.confidence,
+                bbox=face.bbox,
+                source=face.source,
+                class_id=face.class_id,
+                track_id=face.track_id,
+            )
+            for face in faces[:1]
+        ]
+
+    @staticmethod
+    def _face_display_target(target):
+        return type(target)(
+            target_id=target.target_id,
+            detection=Detection(
+                label="face",
+                confidence=target.detection.confidence,
+                bbox=target.detection.bbox,
+                source=target.detection.source,
+                class_id=target.detection.class_id,
+                track_id=target.detection.track_id,
+            ),
+            source_track_id=target.source_track_id,
+            stable_frames=target.stable_frames,
+            lost_frames=target.lost_frames,
+            last_seen=target.last_seen,
+        )
 
     @staticmethod
     def _scale_detection(detection: Detection, scale_x: float, scale_y: float, max_w: int, max_h: int) -> Detection:
@@ -461,7 +610,13 @@ class RoverVisionApp:
         except Exception as exc:
             bus.emit(SystemEvents.LOG_MESSAGE, f"[RoverVisionApp] detector preload failed: {exc}")
 
-    def _render_overlay(self, frame: np.ndarray, detections, target, mode: ControlMode) -> np.ndarray:
+    def _render_overlay(
+        self,
+        frame: np.ndarray,
+        detections: Sequence[Detection],
+        target,
+        mode: ControlMode,
+    ) -> np.ndarray:
         servo_pan, servo_tilt = self._tracking_controller.current_angles()
         target_coords = None
         if target is not None:
@@ -482,9 +637,9 @@ class RoverVisionApp:
             "locked_target_id": self._target_tracker.locked_target_id(),
             "last_command": self._last_command,
         }
-        return self._hud_renderer.render(frame, list(detections), target, mode, telemetry)
+        return self._hud_renderer.render(frame, detections, target, mode, telemetry)
 
-    def _publish_snapshot(self, frame, detections, target, mode: ControlMode) -> None:
+    def _publish_snapshot(self, frame, detections: Sequence[Detection], target, mode: ControlMode) -> None:
         now = time.monotonic()
         if self._last_loop:
             dt = max(1e-3, now - self._last_loop)
@@ -498,7 +653,7 @@ class RoverVisionApp:
 
         snapshot = VisionSnapshot(
             frame=frame,
-            detections=list(detections),
+            detections=detections if isinstance(detections, list) else list(detections),
             target=target,
             mode=mode,
             fps=self._fps,

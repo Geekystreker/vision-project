@@ -43,3 +43,12 @@ def test_wake_listener_enables_audio_thread_gate(monkeypatch):
     service.set_wake_listener(False)
 
     assert ensure_calls == [(True, False), (False, False)]
+
+
+def test_microphone_status_message_does_not_claim_double_clap_when_wake_disabled():
+    service = AudioService(rover_config)
+
+    service._listening_enabled = True
+    service._wake_enabled = False
+
+    assert service._microphone_status_message() == "[AudioService] Microphone stream active. Listening for voice commands."

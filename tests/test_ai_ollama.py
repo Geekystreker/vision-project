@@ -21,7 +21,7 @@ def test_ollama_generate_emits_connection_status(monkeypatch):
     bus.subscribe(SystemEvents.CONNECTION_STATUS_CHANGED, statuses.append)
     monkeypatch.setattr("modules.ai_ollama.request.urlopen", lambda *_args, **_kwargs: FakeResponse())
     try:
-        engine = OllamaAIEngine()
+        engine = OllamaAIEngine(healthcheck=False)
 
         response = engine._post_generate("hello", timeout=0.1)
     finally:
@@ -42,7 +42,7 @@ def test_ollama_generate_failure_emits_error_status(monkeypatch):
 
     monkeypatch.setattr("modules.ai_ollama.request.urlopen", fail)
     try:
-        engine = OllamaAIEngine()
+        engine = OllamaAIEngine(healthcheck=False)
 
         response = engine._post_generate("hello", timeout=0.1, suppress_log=True)
     finally:

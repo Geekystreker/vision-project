@@ -22,6 +22,7 @@ from PyQt5.QtWidgets import (
 
 from config import RoverConfig
 from core.event_bus import SystemEvents, bus
+from modules.rover_types import ConnectionState
 from ui.arc_reactor_widget import ArcReactorWidget
 from ui.theme import JARVIS_THEME
 
@@ -178,6 +179,7 @@ class JarvisHUD(QMainWindow):
         app = QApplication.instance()
         if app is not None:
             app.installEventFilter(self)
+        QTimer.singleShot(0, lambda: self.setFocus(Qt.OtherFocusReason))
 
         self._input_timer = QTimer(self)
         key_repeat_hz = self._config.key_repeat_hz if self._config is not None else 15
@@ -406,6 +408,7 @@ class JarvisHUD(QMainWindow):
         layout.addWidget(inspect_btn)
 
         self.input_box = QLineEdit()
+        self.input_box.setFocusPolicy(Qt.ClickFocus)
         self.input_box.setPlaceholderText("Ask V.I.S.I.O.N to explain the project, move the rover, or inspect the scene...")
         self.input_box.returnPressed.connect(self._submit_text)
         layout.addWidget(self.input_box, 1)
@@ -446,17 +449,7 @@ class JarvisHUD(QMainWindow):
         state = getattr(status, "state", None)
         state_text = getattr(state, "value", "UNKNOWN")
         detail = (getattr(status, "detail", "") or "").lower()
-        if channel == "camera":
-            self.camera_chip.setText(f"CAM {state_text}")
-            self.camera_link_badge.setText(f"CAM {state_text}")
-        elif channel == "motor":
-            self.motor_chip.setText("MOTOR STANDBY" if "disabled" in detail else f"MOTOR {state_text}")
-        elif channel == "servo":
-            self.servo_chip.setText("SERVO STANDBY" if "disabled" in detail else f"SERVO {state_text}")
-        elif channel == "detector":
-            self.detector_chip.setText(f"YOLO {state_text}")
-        elif channel == "ollama":
-            self.ollama_chip.setText(f"OLLAMA {state_text}")
+        self._apply_connection_state(channel, state_text, detail)
 
     def _update_telemetry(self, cmd: str) -> None:
         cmd = (cmd or "").upper()
@@ -474,6 +467,10 @@ class JarvisHUD(QMainWindow):
     def _update_frame(self, snapshot) -> None:
         if snapshot is None:
             return
+        links = getattr(snapshot, "links", None) or {}
+        for channel, state in links.items():
+            state_text = getattr(state, "value", "UNKNOWN")
+            self._apply_connection_state(str(channel), state_text)
         frame = getattr(snapshot, "frame", None)
         render_fps = getattr(snapshot, "fps", 0.0)
         source_fps = getattr(snapshot, "source_fps", 0.0)
@@ -506,6 +503,37 @@ class JarvisHUD(QMainWindow):
         height, width, _ = frame.shape
         image = QImage(frame.data, width, height, frame.strides[0], QImage.Format_RGB888)
         self.camera_feed.set_frame_image(image)
+
+    def _apply_connection_state(self, channel: str, state_text: str, detail: str = "") -> None:
+        chip_text, badge_text = self.connection_labels(channel, state_text, detail)
+        if channel == "camera":
+            self.camera_chip.setText(chip_text)
+            if badge_text is not None:
+                self.camera_link_badge.setText(badge_text)
+        elif channel == "motor":
+            self.motor_chip.setText(chip_text)
+        elif channel == "servo":
+            self.servo_chip.setText(chip_text)
+        elif channel == "detector":
+            self.detector_chip.setText(chip_text)
+        elif channel == "ollama":
+            self.ollama_chip.setText(chip_text)
+
+    @staticmethod
+    def connection_labels(channel: str, state_text: str, detail: str = "") -> tuple[str, str | None]:
+        state_text = (state_text or "UNKNOWN").upper()
+        detail = (detail or "").lower()
+        if channel == "camera":
+            return f"CAM {state_text}", f"CAM {state_text}"
+        if channel == "motor":
+            return ("MOTOR STANDBY" if "disabled" in detail else f"MOTOR {state_text}"), None
+        if channel == "servo":
+            return ("SERVO STANDBY" if "disabled" in detail else f"SERVO {state_text}"), None
+        if channel == "detector":
+            return f"YOLO {state_text}", None
+        if channel == "ollama":
+            return f"OLLAMA {state_text}", None
+        return f"{channel.upper()} {state_text}", None
 
     def _handle_voice_input(self, text: str) -> None:
         self.request_handler(text)
@@ -561,7 +589,7 @@ class JarvisHUD(QMainWindow):
     def _is_global_control_key(self, key: int) -> bool:
         return (
             key in self.SERVO_KEY_MAP
-            or key in {Qt.Key_Space, Qt.Key_T, Qt.Key_P, Qt.Key_I, Qt.Key_M}
+            or key in {Qt.Key_Space, Qt.Key_T, Qt.Key_P, Qt.Key_I, Qt.Key_M, Qt.Key_Escape}
         )
 
     def _handle_key_press(self, event) -> bool:
@@ -576,6 +604,11 @@ class JarvisHUD(QMainWindow):
 
         self._debug_key_press(event)
 
+        if key == Qt.Key_Escape:
+            self.input_box.clearFocus()
+            self.setFocus(Qt.OtherFocusReason)
+            event.accept()
+            return True
         if key == Qt.Key_M:
             self.mic_btn.setChecked(not self.mic_btn.isChecked())
             self._toggle_mic()
@@ -641,7 +674,7 @@ class JarvisHUD(QMainWindow):
         return (
             key in self.DRIVE_KEY_MAP
             or key in self.SERVO_KEY_MAP
-            or key in {Qt.Key_Space, Qt.Key_T, Qt.Key_P, Qt.Key_I, Qt.Key_M}
+            or key in {Qt.Key_Space, Qt.Key_T, Qt.Key_P, Qt.Key_I, Qt.Key_M, Qt.Key_Escape}
         )
 
     def _most_recent_servo_command(self) -> str | None:

@@ -25,8 +25,14 @@ DEFAULT_ESP32_IP = os.getenv("ROVER_ESP32_IP", "192.168.137.101")
 DEFAULT_CAMERA_IP = os.getenv("ROVER_CAMERA_IP", "192.168.137.100")
 DEFAULT_CAMERA_STREAM_URL = os.getenv("ROVER_CAMERA_STREAM_URL", f"http://{DEFAULT_CAMERA_IP}:81/stream")
 DEFAULT_JARVIS_WS_URL = f"ws://{DEFAULT_ESP32_IP}:80/Jarvis"
+DEFAULT_DEV_BOARD_UDP_PORT = int(os.getenv("ROVER_DEV_BOARD_UDP_PORT", "4210"))
+DEFAULT_DEV_BOARD_UDP_URL = os.getenv("ROVER_DEV_BOARD_UDP_URL", f"udp://{DEFAULT_ESP32_IP}:{DEFAULT_DEV_BOARD_UDP_PORT}")
 DEFAULT_SERVO_WS_URL = os.getenv("ROVER_SERVO_WS_URL", DEFAULT_JARVIS_WS_URL)
 DEFAULT_MOTOR_WS_URL = os.getenv("ROVER_MOTOR_WS_URL", DEFAULT_JARVIS_WS_URL)
+DEFAULT_SERVO_URL = os.getenv("ROVER_SERVO_URL", DEFAULT_DEV_BOARD_UDP_URL)
+DEFAULT_MOTOR_URL = os.getenv("ROVER_MOTOR_URL", DEFAULT_DEV_BOARD_UDP_URL)
+DEFAULT_TRANSPORT_PROTOCOL = (os.getenv("ROVER_TRANSPORT_PROTOCOL", "legacy_csv") or "legacy_csv").strip().lower()
+DEFAULT_STATUS_LED_COLOR = os.getenv("ROVER_STATUS_LED", "blue")
 DEFAULT_PERFORMANCE_PROFILE = (os.getenv("VISION_PERF_PROFILE", "rtx5060") or "rtx5060").strip().lower()
 
 
@@ -63,7 +69,7 @@ class RoverConfig:
     camera_flip_code: int | None = -1
 
     # Manual pan / tilt
-    servo_step: float = 1.0
+    servo_step: float = 4.0
     servo_center_angle: int = 90
     servo_min_angle: int = 10
     servo_max_angle: int = 170
@@ -72,12 +78,16 @@ class RoverConfig:
     servo_tilt_min_angle: int = 10
     servo_tilt_max_angle: int = 155
     servo_manual_pan_direction: int = -1
-    servo_manual_tilt_direction: int = -1
+    servo_manual_tilt_direction: int = 1
+    servo_tracking_pan_direction: int = -1
+    servo_tracking_tilt_direction: int = 1
     servo_send_hz: int = 24
     servo_max_step_deg: float = 3.0
     servo_max_speed_deg_per_sec: float = 72.0
-    servo_min_delta_deg: float = 1.15
+    servo_min_delta_deg: float = 0.55
     servo_motion_smoothing_alpha: float = 0.34
+    servo_easing_min: float = 0.20
+    servo_easing_exponent: float = 1.45
     motor_drive_speed: int = 170
     motor_turn_speed: int = 150
     motor_send_hz: int = 20
@@ -95,9 +105,23 @@ class RoverConfig:
     target_acquisition_frames: int = 1
     target_rebind_frames: int = 2
     target_lock_frames: int = 3
+    target_center_weight: float = 0.65
+    target_front_area_weight: float = 2.4
+    target_min_acquire_area_fraction: float = 0.0025
     target_box_smoothing_alpha: float = 0.18
     follow_pan_align_threshold_deg: float = 12.0
     scene_announce_cooldown_seconds: float = 6.0
+    face_lock_enabled: bool = True
+    face_lock_yolo_fallback_enabled: bool = True
+    face_detector_scale_factor: float = 1.08
+    face_detector_min_neighbors: int = 3
+    face_detector_min_size_px: int = 18
+    face_detector_max_faces: int = 3
+    face_proxy_width_fraction: float = 0.42
+    face_proxy_height_fraction: float = 0.24
+    face_proxy_y_fraction: float = 0.07
+    tracking_moving_average_window: int = 3
+    # PID constants are intentionally damped for smooth deceleration near center.
     pid_integral_limit: float = 1.6
     pan_pid_kp: float = 13.0
     pan_pid_ki: float = 0.55
@@ -107,9 +131,13 @@ class RoverConfig:
     tilt_pid_kd: float = 2.3
     tracking_deadband_px: int = 16
     tracking_measurement_alpha: float = 0.24
+    tracking_predict_on_loss: bool = False
+    tracking_loss_bridge_seconds: float = 0.09
+    tracking_loss_bridge_velocity_scale: float = 0.5
     kalman_max_prediction_frames: int = 30
     kalman_process_noise: float = 35.0
     kalman_measurement_noise: float = 90.0
+    servo_hardware_latency_seconds: float = 0.10
 
     # Autonomous navigation
     autonomous_stop_fraction: float = 0.26
@@ -122,6 +150,9 @@ class RoverConfig:
     # Transport
     ws_recv_timeout: float = 2.0
     reconnect_interval: float = 3.0
+    transport_protocol: str = DEFAULT_TRANSPORT_PROTOCOL
+    status_led_color: str = DEFAULT_STATUS_LED_COLOR
+    dev_board_udp_port: int = DEFAULT_DEV_BOARD_UDP_PORT
 
     # Detector
     detector_backend: str = "yolo26"
@@ -216,10 +247,12 @@ PERFORMANCE_PROFILES: dict[str, dict[str, int | float | str]] = {
         "servo_send_hz": 26,
         "servo_max_step_deg": 2.8,
         "servo_max_speed_deg_per_sec": 68.0,
-        "servo_min_delta_deg": 1.2,
+        "servo_min_delta_deg": 0.65,
         "servo_motion_smoothing_alpha": 0.30,
-        "target_acquisition_frames": 3,
-        "target_rebind_frames": 3,
+        "servo_easing_min": 0.18,
+        "servo_easing_exponent": 1.55,
+        "target_acquisition_frames": 1,
+        "target_rebind_frames": 1,
         "target_box_smoothing_alpha": 0.16,
         "pan_pid_kp": 12.0,
         "pan_pid_ki": 0.45,
@@ -227,8 +260,12 @@ PERFORMANCE_PROFILES: dict[str, dict[str, int | float | str]] = {
         "tilt_pid_kp": 10.0,
         "tilt_pid_ki": 0.35,
         "tilt_pid_kd": 2.1,
-        "tracking_deadband_px": 18,
+        "tracking_deadband_px": 20,
         "tracking_measurement_alpha": 0.18,
+        "tracking_moving_average_window": 3,
+        "tracking_loss_bridge_seconds": 0.08,
+        "tracking_loss_bridge_velocity_scale": 0.5,
+        "servo_hardware_latency_seconds": 0.12,
         "kalman_max_prediction_frames": 30,
         "kalman_process_noise": 18.0,
         "kalman_measurement_noise": 130.0,
@@ -243,8 +280,8 @@ def build_rover_config(profile: str | None = None) -> RoverConfig:
     overrides = PERFORMANCE_PROFILES[selected]
     return RoverConfig(
         vision_stream_url=DEFAULT_CAMERA_STREAM_URL,
-        servo_url=DEFAULT_SERVO_WS_URL,
-        motor_url=DEFAULT_MOTOR_WS_URL,
+        servo_url=DEFAULT_SERVO_URL,
+        motor_url=DEFAULT_MOTOR_URL,
         ws_recv_timeout=5.0,
         reconnect_interval=2.0,
         **overrides,

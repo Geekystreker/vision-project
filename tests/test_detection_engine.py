@@ -27,7 +27,7 @@ def make_detection(label: str, area_scale: int) -> Detection:
 
 
 def test_detection_engine_uses_backend():
-    cfg = RoverConfig("ws://cam", "ws://servo", "ws://motor")
+    cfg = RoverConfig("ws://cam", "ws://servo", "ws://motor", face_lock_enabled=False)
     backend = FakeBackend([make_detection("person", 12)])
     engine = DetectionEngine(cfg, backend=backend)
     engine.load()
@@ -38,7 +38,7 @@ def test_detection_engine_uses_backend():
 
 
 def test_select_primary_prefers_largest_target_label():
-    cfg = RoverConfig("ws://cam", "ws://servo", "ws://motor")
+    cfg = RoverConfig("ws://cam", "ws://servo", "ws://motor", face_lock_enabled=False)
     detections = [
         make_detection("person", 8),
         make_detection("bottle", 20),
@@ -52,7 +52,7 @@ def test_select_primary_prefers_largest_target_label():
 
 
 def test_detection_engine_suppresses_nested_duplicate_target_boxes():
-    cfg = RoverConfig("ws://cam", "ws://servo", "ws://motor")
+    cfg = RoverConfig("ws://cam", "ws://servo", "ws://motor", face_lock_enabled=False)
     detections = [
         Detection(label="person", confidence=0.82, bbox=BoundingBox(0, 0, 100, 180, confidence=0.82)),
         Detection(label="person", confidence=0.91, bbox=BoundingBox(28, 24, 34, 46, confidence=0.91)),
@@ -64,6 +64,25 @@ def test_detection_engine_suppresses_nested_duplicate_target_boxes():
     assert len(result) == 1
     assert result[0].bbox.w == 100
     assert result[0].bbox.h == 180
+
+
+def test_detection_engine_adds_opencv_face_detections():
+    cfg = RoverConfig("ws://cam", "ws://servo", "ws://motor", face_lock_enabled=True)
+    engine = DetectionEngine(cfg, backend=FakeBackend([]))
+
+    class FakeCascade:
+        def detectMultiScale(self, *_args, **_kwargs):
+            return [(3, 4, 12, 14)]
+
+    engine._face_cascade = FakeCascade()
+    engine._face_ready = True
+
+    result = engine.detect(np.zeros((8, 8, 3), dtype=np.uint8))
+
+    assert len(result) == 1
+    assert result[0].label == "face"
+    assert result[0].bbox.x == 3
+    assert result[0].bbox.h == 14
 
 
 def test_detection_engine_ignores_empty_frame_source():

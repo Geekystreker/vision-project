@@ -146,7 +146,7 @@ def test_consume_mjpeg_chunk_extracts_complete_frame():
     assert latest == payload
 
 
-def test_mjpeg_transport_falls_back_to_raw_http_after_ffmpeg_failure(monkeypatch):
+def test_mjpeg_transport_prefers_raw_http_before_ffmpeg(monkeypatch):
     config = RoverConfig("http://localhost:81/stream", "ws://servo", "ws://motor")
     stream = VisionStream(config.vision_stream_url, config)
     calls: list[str] = []
@@ -167,4 +167,18 @@ def test_mjpeg_transport_falls_back_to_raw_http_after_ffmpeg_failure(monkeypatch
     stream._running = True
     stream._run_mjpeg()
 
-    assert calls[:2] == ["ffmpeg", "raw-http"]
+    assert calls == ["raw-http"]
+
+
+def test_mjpeg_parser_discards_old_complete_frames_from_same_chunk(monkeypatch):
+    cfg = RoverConfig("http://cam/stream", "ws://servo", "ws://motor")
+    stream = VisionStream("http://cam/stream", cfg)
+    ingested = []
+    monkeypatch.setattr(stream, "_ingest_frame", lambda payload: ingested.append(payload))
+    buffer = bytearray()
+    frame_one = b"\xff\xd8old\xff\xd9"
+    frame_two = b"\xff\xd8new\xff\xd9"
+
+    stream._consume_mjpeg_chunk(frame_one + frame_two, buffer)
+
+    assert ingested == [frame_two]

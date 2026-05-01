@@ -1,14 +1,18 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import json
+import socket
 import threading
 import time
 from typing import Optional
+from urllib.parse import urlparse
 
 import websocket
 
 from config import RoverConfig
 from core.event_bus import SystemEvents, bus
+from modules.jarvis_protocol import servo_packet, uses_json_protocol, uses_legacy_protocol
 from modules.rover_types import ConnectionState, ConnectionStatus
 
 
@@ -24,16 +28,19 @@ class ServoController:
     def __init__(self, url: str, config: RoverConfig) -> None:
         self._url = url
         self._config = config
+        self._transport = self._resolve_transport(url)
+        self._udp_target = self._resolve_udp_target(url)
         self._lock = threading.Lock()
         self._running = False
         self._started = False
         self._thread: Optional[threading.Thread] = None
         self._sender_thread: Optional[threading.Thread] = None
         self._app: Optional[websocket.WebSocketApp] = None
+        self._udp_socket: Optional[socket.socket] = None
         self._connected = False
         self._connected_event = threading.Event()
         self._send_event = threading.Event()
-        self._disabled = not bool((url or "").strip())
+        self._disabled = not bool((url or "").strip()) or (self._transport == "udp" and self._udp_target is None)
         self._pending_command: PendingServoCommand | None = None
         self._transport_latency_ms = 0.0
         self._pan_angle = int(config.servo_center_angle)
@@ -49,8 +56,11 @@ class ServoController:
             return
         self._running = True
         self._started = True
-        self._thread = threading.Thread(target=self._run, daemon=True, name="ServoControllerSocket_Thread")
-        self._thread.start()
+        if self._transport == "udp":
+            self._start_udp_transport()
+        else:
+            self._thread = threading.Thread(target=self._run, daemon=True, name="ServoControllerSocket_Thread")
+            self._thread.start()
         self._sender_thread = threading.Thread(
             target=self._sender_loop,
             daemon=True,
@@ -64,28 +74,39 @@ class ServoController:
         self._connected_event.clear()
         self._send_event.set()
         app = self._app
+        udp_socket = self._udp_socket
         if app is not None:
             try:
                 app.close()
             except Exception:
                 pass
+        if udp_socket is not None:
+            try:
+                udp_socket.close()
+            except Exception:
+                pass
+            self._udp_socket = None
+        self._set_state(ConnectionState.DISCONNECTED)
 
     def send(self, command: str) -> bool:
         if self._disabled:
             return False
         if not self._started:
             self.start()
+        payload = self._payload_for_command(command)
+        if not payload:
+            return False
         now = time.monotonic()
         with self._lock:
             self._update_cached_angles(command)
-            if self._pending_command is not None and self._pending_command.payload == command:
+            if self._pending_command is not None and self._pending_command.payload == payload:
                 return True
             if (
-                self._last_sent_payload == command
+                self._last_sent_payload == payload
                 and (now - self._last_sent_at) < (1.0 / max(1, self._config.servo_send_hz))
             ):
                 return True
-            self._pending_command = PendingServoCommand(payload=command, enqueued_at=time.monotonic())
+            self._pending_command = PendingServoCommand(payload=payload, enqueued_at=time.monotonic())
         self._send_event.set()
         return True
 
@@ -95,7 +116,7 @@ class ServoController:
         with self._lock:
             self._pan_angle = pan
             self._tilt_angle = tilt
-        return self.send(f"Pan,{pan}\nTilt,{tilt}")
+        return self.send(self._format_servo_payload(pan=pan, tilt=tilt))
 
     def current_angles(self) -> tuple[int, int]:
         with self._lock:
@@ -112,6 +133,10 @@ class ServoController:
         connected = state == ConnectionState.CONNECTED
         if self._connected != connected or detail:
             self._connected = connected
+            if connected:
+                self._connected_event.set()
+            else:
+                self._connected_event.clear()
             bus.emit(
                 SystemEvents.CONNECTION_STATUS_CHANGED,
                 ConnectionStatus(channel="servo", state=state, detail=detail),
@@ -121,8 +146,11 @@ class ServoController:
         self._connected_event.set()
         self._set_state(ConnectionState.CONNECTED)
         bus.emit(SystemEvents.LOG_MESSAGE, "[ServoController] Connected to servo websocket.")
-        pan, tilt = self.current_angles()
-        self.send_pan_tilt(pan, tilt)
+        with self._lock:
+            has_prior_pose = bool(self._last_sent_payload or self._pending_command is not None)
+        if has_prior_pose:
+            pan, tilt = self.current_angles()
+            self.send_pan_tilt(pan, tilt)
 
     def _on_error(self, _app, error) -> None:
         self._set_state(ConnectionState.ERROR, str(error))
@@ -156,6 +184,22 @@ class ServoController:
                     time.sleep(self._config.reconnect_interval)
         finally:
             self._set_state(ConnectionState.DISCONNECTED)
+
+    def _start_udp_transport(self) -> None:
+        if self._udp_target is None:
+            self._set_state(ConnectionState.DISCONNECTED, "invalid UDP servo endpoint")
+            self._disabled = True
+            return
+        try:
+            udp_socket = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            udp_socket.setblocking(False)
+            self._udp_socket = udp_socket
+            self._set_state(ConnectionState.CONNECTED, f"udp://{self._udp_target[0]}:{self._udp_target[1]}")
+            bus.emit(SystemEvents.LOG_MESSAGE, "[ServoController] UDP transport ready for low-latency pan/tilt.")
+        except Exception as exc:
+            self._disabled = True
+            self._set_state(ConnectionState.ERROR, str(exc))
+            bus.emit(SystemEvents.LOG_MESSAGE, f"[ServoController] UDP setup error: {exc}")
 
     def _sender_loop(self) -> None:
         interval = 1.0 / max(1, self._config.servo_send_hz)
@@ -203,6 +247,8 @@ class ServoController:
 
     def _send_immediately(self, command: PendingServoCommand) -> bool:
         try:
+            if self._transport == "udp":
+                return self._send_udp_payload(command)
             with self._lock:
                 app = self._app
             if app and app.sock and app.sock.connected:
@@ -222,8 +268,80 @@ class ServoController:
             bus.emit(SystemEvents.LOG_MESSAGE, f"[ServoController] send error: {exc}")
         return False
 
+    def _send_udp_payload(self, command: PendingServoCommand) -> bool:
+        if self._udp_target is None:
+            return False
+        with self._lock:
+            udp_socket = self._udp_socket
+        if udp_socket is None:
+            return False
+        try:
+            started = time.monotonic()
+            host, port = self._udp_target
+            for payload in command.payload.splitlines():
+                payload = payload.strip()
+                if payload:
+                    udp_socket.sendto(payload.encode("utf-8"), (host, port))
+            latency_ms = (time.monotonic() - command.enqueued_at) * 1000.0
+            transport_ms = (time.monotonic() - started) * 1000.0
+            with self._lock:
+                self._transport_latency_ms = max(latency_ms, transport_ms)
+                self._last_sent_payload = command.payload
+                self._last_sent_at = time.monotonic()
+            return True
+        except Exception as exc:
+            self._set_state(ConnectionState.ERROR, str(exc))
+            bus.emit(SystemEvents.LOG_MESSAGE, f"[ServoController] UDP send error: {exc}")
+            return False
+
     def _update_cached_angles(self, payload: str) -> None:
-        for line in str(payload or "").splitlines():
+        for axis, value in self._extract_servo_axes(payload).items():
+            if axis == "pan":
+                self._pan_angle = max(self._config.servo_pan_min_angle, min(self._config.servo_pan_max_angle, value))
+            elif axis == "tilt":
+                self._tilt_angle = max(self._config.servo_tilt_min_angle, min(self._config.servo_tilt_max_angle, value))
+
+    def _payload_for_command(self, payload: str) -> str:
+        text = str(payload or "").strip()
+        if not text:
+            return ""
+        axes = self._extract_servo_axes(text)
+        if axes:
+            return self._format_servo_payload(pan=axes.get("pan"), tilt=axes.get("tilt"))
+        return text
+
+    def _format_servo_payload(self, *, pan: int | None = None, tilt: int | None = None) -> str:
+        lines: list[str] = []
+        if uses_json_protocol(self._config):
+            lines.append(servo_packet(self._config, pan=pan, tilt=tilt))
+        if not uses_legacy_protocol(self._config):
+            return "\n".join(lines)
+        if pan is not None:
+            lines.append(f"Pan,{pan}")
+        if tilt is not None:
+            lines.append(f"Tilt,{tilt}")
+        return "\n".join(lines)
+
+    def _extract_servo_axes(self, payload: str) -> dict[str, int]:
+        text = str(payload or "").strip()
+        if not text:
+            return {}
+        if text.startswith("{"):
+            try:
+                packet = json.loads(text.splitlines()[0])
+            except json.JSONDecodeError:
+                return {}
+            axes: dict[str, int] = {}
+            for axis in ("pan", "tilt"):
+                if axis in packet:
+                    try:
+                        axes[axis] = int(float(packet[axis]))
+                    except (TypeError, ValueError):
+                        pass
+            return axes
+
+        axes: dict[str, int] = {}
+        for line in text.splitlines():
             tokens = [part.strip() for part in line.split(",") if part.strip()]
             if len(tokens) < 2:
                 continue
@@ -233,6 +351,23 @@ class ServoController:
             except ValueError:
                 continue
             if axis == "pan":
-                self._pan_angle = max(self._config.servo_pan_min_angle, min(self._config.servo_pan_max_angle, value))
+                axes["pan"] = value
             elif axis == "tilt":
-                self._tilt_angle = max(self._config.servo_tilt_min_angle, min(self._config.servo_tilt_max_angle, value))
+                axes["tilt"] = value
+        return axes
+
+    @staticmethod
+    def _resolve_transport(url: str) -> str:
+        scheme = urlparse(str(url or "")).scheme.lower()
+        if scheme == "udp":
+            return "udp"
+        return "websocket"
+
+    @staticmethod
+    def _resolve_udp_target(url: str) -> tuple[str, int] | None:
+        parsed = urlparse(str(url or ""))
+        if parsed.scheme.lower() != "udp":
+            return None
+        if not parsed.hostname or parsed.port is None:
+            return None
+        return parsed.hostname, int(parsed.port)

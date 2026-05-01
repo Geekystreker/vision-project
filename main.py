@@ -108,7 +108,7 @@ def manual_servo_delta(
     return None
 
 
-class MainController:
+class JarvisSystem:
     def __init__(self):
         self.memory = Memory()
         self.intent_router = IntentRouter()
@@ -416,7 +416,7 @@ def main():
         )
         return 0
 
-    controller = MainController()
+    controller = JarvisSystem()
     window = JarvisHUD(request_handler_callback=controller.handle_request, config=rover_config)
     window.show()
 
@@ -427,8 +427,6 @@ def main():
 
     bridge = MainThreadBridge(activate_window)
     controller.audio_service.set_launch_callback(bridge.activation_requested.emit)
-    controller.audio_service.set_wake_listener(True)
-    bus.emit(SystemEvents.LOG_MESSAGE, "[AudioService] Clap listener active.")
 
     if guard is not None:
         guard.activation_requested.connect(activate_window)
@@ -440,3 +438,6 @@ def main():
 
 if __name__ == "__main__":
     sys.exit(main())
+
+
+MainController = JarvisSystem

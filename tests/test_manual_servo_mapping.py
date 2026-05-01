@@ -15,9 +15,10 @@ class DummyVisionApp:
 
 
 def test_autonomous_button_command_engages_target_lock(monkeypatch):
-    from main import MainController
+    from main import JarvisSystem, MainController
 
-    controller = MainController.__new__(MainController)
+    assert MainController is JarvisSystem
+    controller = JarvisSystem.__new__(JarvisSystem)
     controller.rover_vision_app = DummyVisionApp()
 
     controller._handle_raw_command("__ENGAGE_AUTONOMOUS__")

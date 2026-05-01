@@ -111,7 +111,7 @@ class AudioService:
             self._log(f"[AudioService] Microphone unavailable; clap listener cannot start: {exc}")
             self._running = False
             return
-        self._log("[AudioService] Microphone stream active. Listening for double clap.")
+        self._log(self._microphone_status_message())
 
         speech_frames: list[bytes] = []
         speech_active = False
@@ -226,6 +226,13 @@ class AudioService:
 
     def _in_tts_cooldown(self) -> bool:
         return (time.time() - self._last_tts_done) < self._TTS_COOLDOWN
+
+    def _microphone_status_message(self) -> str:
+        if self._wake_enabled and self._listening_enabled:
+            return "[AudioService] Microphone stream active. Listening for voice commands and double clap."
+        if self._wake_enabled:
+            return "[AudioService] Microphone stream active. Listening for double clap."
+        return "[AudioService] Microphone stream active. Listening for voice commands."
 
     @staticmethod
     def _normalized_peak(chunk: bytes) -> float:

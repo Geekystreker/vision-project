@@ -5,8 +5,8 @@ from config import PROJECT_ROOT, RoverConfig, build_rover_config
 
 DUMMY_CONFIG = RoverConfig(
     vision_stream_url="ws://localhost/Camera",
-    servo_url="ws://localhost/Jarvis",
-    motor_url="ws://localhost/Jarvis",
+    servo_url="udp://localhost:4210",
+    motor_url="udp://localhost:4210",
 )
 
 
@@ -19,8 +19,11 @@ def test_required_fields_exist():
     assert cfg.detector_confidence == 0.30
     assert cfg.detector_track_classes == (0,)
     assert cfg.camera_flip_code == -1
+    assert cfg.servo_step == 4.0
     assert cfg.servo_send_hz > 0
     assert cfg.servo_motion_smoothing_alpha > 0
+    assert cfg.servo_easing_min > 0
+    assert cfg.servo_easing_exponent > 0
     assert cfg.servo_center_angle == 90
     assert cfg.servo_min_angle == 10
     assert cfg.servo_max_angle == 170
@@ -28,23 +31,41 @@ def test_required_fields_exist():
     assert cfg.servo_pan_max_angle == 170
     assert cfg.servo_tilt_min_angle == 10
     assert cfg.servo_tilt_max_angle == 155
+    assert cfg.servo_manual_tilt_direction == 1
+    assert cfg.servo_tracking_tilt_direction == 1
     assert cfg.servo_manual_pan_direction in {-1, 1}
     assert cfg.servo_manual_tilt_direction in {-1, 1}
+    assert cfg.servo_tracking_pan_direction in {-1, 1}
+    assert cfg.servo_tracking_tilt_direction in {-1, 1}
     assert cfg.motor_drive_speed > 0
     assert cfg.motor_turn_speed > 0
     assert cfg.motor_send_hz > 0
     assert cfg.motor_command_ttl_seconds > 0
+    assert cfg.transport_protocol == "legacy_csv"
+    assert cfg.status_led_color == "blue"
     assert cfg.autonomous_clear_frames_required >= 1
     assert cfg.pan_pid_kp > 0
     assert cfg.tilt_pid_kp > 0
     assert cfg.tracking_deadband_px > 0
     assert cfg.follow_pan_align_threshold_deg > 0
+    assert cfg.face_lock_enabled is True
+    assert cfg.face_lock_yolo_fallback_enabled is True
+    assert cfg.face_detector_min_size_px > 0
+    assert cfg.face_proxy_width_fraction > 0
+    assert cfg.face_proxy_height_fraction > 0
+    assert cfg.face_proxy_y_fraction >= 0
     assert cfg.kalman_max_prediction_frames == 30
     assert cfg.kalman_process_noise > 0
     assert cfg.kalman_measurement_noise > 0
+    assert cfg.servo_hardware_latency_seconds >= 0
     assert cfg.detector_tracking_iou > 0
     assert cfg.target_acquisition_frames >= 1
     assert cfg.target_rebind_frames >= 1
+    assert cfg.target_min_acquire_area_fraction > 0
+    assert cfg.tracking_moving_average_window >= 1
+    assert cfg.tracking_predict_on_loss is False
+    assert cfg.tracking_loss_bridge_seconds > 0
+    assert 0 < cfg.tracking_loss_bridge_velocity_scale <= 1
     assert cfg.resolved_tracker_config_path.name == "rover_botsort.yaml"
     assert cfg.audio_sample_rate > 0
     assert cfg.key_repeat_hz > 0
@@ -54,15 +75,15 @@ def test_required_fields_exist():
 
 def test_url_fields_are_strings():
     assert DUMMY_CONFIG.vision_stream_url.startswith(("ws://", "wss://", "http://", "https://"))
-    assert DUMMY_CONFIG.servo_url.startswith("ws://")
-    assert DUMMY_CONFIG.motor_url.startswith("ws://")
+    assert DUMMY_CONFIG.servo_url.startswith(("ws://", "udp://"))
+    assert DUMMY_CONFIG.motor_url.startswith(("ws://", "udp://"))
 
 
-def test_build_rover_config_defaults_to_shared_jarvis_websocket():
+def test_build_rover_config_defaults_to_shared_udp_dev_board_endpoint():
     cfg = build_rover_config("rtx5060")
 
-    assert cfg.servo_url.endswith("/Jarvis")
-    assert cfg.motor_url.endswith("/Jarvis")
+    assert cfg.servo_url == "udp://192.168.137.101:4210"
+    assert cfg.motor_url == "udp://192.168.137.101:4210"
     assert cfg.servo_url == cfg.motor_url
 
 
@@ -70,7 +91,7 @@ def test_build_rover_config_uses_separate_default_camera_ip():
     cfg = build_rover_config("rtx5060")
 
     assert cfg.vision_stream_url == "http://192.168.137.100:81/stream"
-    assert cfg.servo_url == "ws://192.168.137.101:80/Jarvis"
+    assert cfg.servo_url == "udp://192.168.137.101:4210"
 
 
 def test_legacy_yolo_properties_map_to_detector_fields():
@@ -119,7 +140,9 @@ def test_build_rover_config_uses_rtx5060_profile_defaults():
     assert cfg.detector_confidence == 0.32
     assert cfg.detector_tracking_confidence == 0.36
     assert cfg.servo_send_hz == 26
-    assert cfg.target_acquisition_frames == 3
+    assert cfg.target_acquisition_frames == 1
+    assert cfg.tracking_deadband_px == 20
+    assert cfg.tracking_moving_average_window == 3
 
 
 def test_build_rover_config_falls_back_to_mx330_for_unknown_profile():
